@@ -214,6 +214,30 @@ class BuildScriptTests(unittest.TestCase):
         self.assertEqual(files_under(self.dist), [name for name in before if not name.startswith(('0.11.0/', '0.11.1/'))])
         self.assertIn(b'0.11.3', result.stdout + result.stderr)   # the kept folders are named in a warning
 
+    def test_old_build_cleanup_accepts_short_paths_without_removing_current_or_user_data(self):
+        import ctypes
+        make_files(self.dist, '0.11.4/DotVoice/DotVoice.exe', '0.11.3/DotVoice/runtime/notes/n0.md',
+                   '0.11.1/DotVoice/DotVoice.exe', '0.11.1/DotVoice/runtime/smoke/runtime/ui-smoke.json',
+                   '0.11.0/DotVoice/DotVoice.exe', 'notes/keep.md')
+        before = files_under(self.dist)
+
+        def short(path):
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+            self.assertTrue(0 < size < len(buffer))
+            return buffer.value
+
+        dist, current = short(self.dist), short(self.dist / '0.11.4')
+        if dist.casefold() == str(self.dist).casefold():
+            self.skipTest('this volume does not generate 8.3 aliases')
+        result = build_functions(['Remove-OldBuilds $env:DV_DIST $env:DV_OUT'],
+                                 {'DV_DIST': dist, 'DV_OUT': current, 'DV_BIN': str(self.bin)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(p.name for p in self.dist.iterdir()), ['0.11.3', '0.11.4', 'notes'],
+                         result.stdout + result.stderr)
+        self.assertEqual(sorted(p.name for p in self.bin.iterdir()), ['0.11.0', '0.11.1'])
+        self.assertEqual(files_under(self.dist), [name for name in before if not name.startswith(('0.11.0/', '0.11.1/'))])
+
     def test_build_script_clears_through_the_guarded_functions_only(self):
         data = (ROOT / 'build.ps1').read_bytes()
         self.assertTrue(all(byte < 128 for byte in data))

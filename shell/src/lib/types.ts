@@ -140,7 +140,7 @@ export interface Prefs {
   mode: Mode;
   category: Category;
   sounds: { enabled: boolean; volume: 'low' | 'medium' | 'high'; keep_awake?: boolean };
-  overlay: { enabled: boolean; on_switch: boolean; linger_seconds: number; position: { x: number; y: number } | null };
+  overlay: { enabled: boolean; on_switch: boolean; linger_seconds: number; position: { x: number; y: number } | null; monitor?: string | null };
   /** show_local_text: show the local preview model's words while speaking (may be wrong). */
   preview: { show_local_text: boolean };
   airmouse: { enabled: boolean; skip_slideshow: boolean };
@@ -343,6 +343,14 @@ export interface AppUpdate {
   available: boolean;
   dismissed: boolean;
   dismissed_version: string | null;
+}
+
+export interface OverlayMonitor {
+  name: string | null;
+  primary: boolean;
+  width: number;
+  height: number;
+  scale_factor: number;
 }
 
 export interface ProbeEvent {

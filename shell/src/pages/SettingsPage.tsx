@@ -11,11 +11,11 @@ import { shell } from '../lib/bridge';
 import { elevationView } from '../lib/elevation';
 import { bindingText, slotLabel } from '../lib/format';
 import { act, useStore } from '../lib/store';
-import type { Bindings, ElevationStatus, Prefs, Tool, WhisperMode } from '../lib/types';
+import type { Bindings, ElevationStatus, OverlayMonitor, Prefs, Tool, WhisperMode } from '../lib/types';
 import { EngineSection } from './EngineSection';
 
 type DeviceTab = 'baseus' | 'pv60' | 'tidepool';
-type SetPrefs = (patch: Record<string, unknown>) => void;
+type SetPrefs = (patch: Record<string, unknown>) => Promise<void>;
 
 function usePrefs() {
   const prefs = useStore((s) => s.prefs);
@@ -658,6 +658,35 @@ function SoundsCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
 }
 
 function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
+  const [monitors, setMonitors] = useState<OverlayMonitor[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [placing, setPlacing] = useState(false);
+  const [monitorError, setMonitorError] = useState('');
+  const selected = prefs.overlay.monitor ?? '';
+  const name = (value: string) => value.replace(/^\\\\\.\\DISPLAY(\d+)$/i, '显示器 $1');
+  const refreshMonitors = useCallback(async () => {
+    setLoading(true);
+    try {
+      const displays = await shell.overlayMonitors();
+      if (!displays?.length) throw new Error('暂时无法读取显示器列表，请刷新重试。');
+      setMonitors(displays);
+      setMonitorError('');
+    } catch (error) { setMonitorError(String((error as Error).message || error)); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { refreshMonitors(); }, [refreshMonitors]);
+  const missing = !!selected && !monitors.some(m => m.name === selected);
+  async function chooseMonitor(value: string) {
+    setPlacing(true);
+    try { await setPrefs({ overlay: { monitor: value || null, position: null } }); }
+    finally { setPlacing(false); }
+  }
+  async function resetPosition() {
+    setPlacing(true);
+    try { await shell.overlayResetPosition(); }
+    catch (error) { useStore.getState().notify(String(error), 'error'); }
+    finally { setPlacing(false); }
+  }
   return (
     <Glass className="px-6 py-1">
       <SettingRow title="灵动胶囊" description="屏幕上方的小胶囊：切换时显示当前模式，录音时显示声线（有可靠的实时文字时一并显示），笔记模式下展开成便签。置顶但不抢输入焦点。">
@@ -670,8 +699,24 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
         <Range label="保存后停留" min={2} max={30} value={prefs.overlay.linger_seconds} className="w-[130px]" disabled={!prefs.overlay.enabled}
           onChange={(v) => setPrefs({ overlay: { linger_seconds: v } })} />
       </SettingRow>
-      <SettingRow title="位置" description="默认跟随主屏顶部居中；也可以直接拖动展开的便签。">
-        <button className="btn btn-sm" onClick={() => shell.overlayResetPosition().catch((error) => useStore.getState().notify(String(error), 'error'))}>回到顶部居中</button>
+      <SettingRow title="位置" description={monitorError || (missing && !loading
+        ? '所选屏幕未连接，暂用主屏；接回后自动恢复。也可拖动便签调整位置。'
+        : monitors.some(m => !m.name) ? '无名称的屏幕无法单独记住；仍可直接拖动便签到该屏幕。'
+          : '在所选屏幕顶部居中；也可以拖动便签保留手动位置。')}>
+        <div className="flex max-w-[230px] flex-col items-stretch gap-2">
+          <select className="field text-[12px]" aria-label="胶囊显示器" value={selected} disabled={loading || placing}
+            onChange={(event) => chooseMonitor(event.target.value)}>
+            <option value="">跟随主显示器（默认）</option>
+            {missing && <option value={selected}>{name(selected)}（未连接）</option>}
+            {monitors.map((m, index) => <option key={m.name ?? `unnamed-${index}`} value={m.name ?? `unnamed-${index}`} disabled={!m.name}>
+              {m.name ? name(m.name) : '无名称显示器'}{m.primary ? ' · 主屏' : ''} · {m.width}×{m.height}
+            </option>)}
+          </select>
+          <div className="flex items-center gap-2">
+            <button className="btn btn-sm" disabled={placing} onClick={resetPosition}>回到顶部居中</button>
+            <button className="btn btn-ghost btn-sm" disabled={loading} onClick={refreshMonitors} aria-label="刷新显示器" title="刷新显示器"><RotateCcw size={14} /></button>
+          </div>
+        </div>
       </SettingRow>
     </Glass>
   );

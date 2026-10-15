@@ -99,6 +99,10 @@ fn saved_position(prefs: &Value) -> Option<(i32, i32)> {
     Some((position.get("x")?.as_i64()?.try_into().ok()?, position.get("y")?.as_i64()?.try_into().ok()?))
 }
 
+fn selected_monitor(prefs: &Value) -> Option<&str> {
+    prefs.get("overlay")?.get("monitor")?.as_str()
+}
+
 /// Core events that the shell itself acts on (tray, hotkeys, overlay position).
 fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
     match event {
@@ -114,7 +118,7 @@ fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
             apply_hotkeys(app, &data["prefs"]);
             appearance::apply(app, &data["prefs"]);
             if let Some(window) = app.get_webview_window("overlay") {
-                overlay::place(&window, saved_position(&data["prefs"]));
+                overlay::place(&window, saved_position(&data["prefs"]), selected_monitor(&data["prefs"]));
                 // Don't depend on the page having fetched its settings in time.
                 if data["prefs"]["overlay"]["enabled"].as_bool().unwrap_or(true) {
                     overlay::show(&window);
@@ -172,7 +176,7 @@ fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
             apply_hotkeys(app, data);
             appearance::apply(app, data);
             shortcut::apply_prefs(app, data);
-            overlay::update_position(app, saved_position(data));
+            overlay::update_position(app, saved_position(data), selected_monitor(data));
         }
         // A core that died mid-presentation can no longer release its tools.
         "core_exit" => {
@@ -235,12 +239,18 @@ fn overlay_backdrop(app: AppHandle, width: Option<u32>) -> Result<tauri::ipc::Re
 }
 
 #[tauri::command]
+fn overlay_monitors(app: AppHandle) -> Result<Vec<overlay::MonitorInfo>, String> {
+    let window = app.get_webview_window("overlay").ok_or("胶囊窗口尚未就绪")?;
+    overlay::monitors(&window)
+}
+
+#[tauri::command]
 async fn overlay_reset_position(app: AppHandle) -> Result<(), String> {
     let core = Arc::clone(&app.state::<Arc<CoreClient>>());
     let result = core.call("prefs_set", json!({"patch": {"overlay": {"position": null}}}), Duration::from_secs(10)).await?;
     if let Some(error) = result["error"].as_str() { return Err(error.to_string()) }
     if let Some(window) = app.get_webview_window("overlay") {
-        overlay::place(&window, None);
+        overlay::place(&window, None, selected_monitor(&result));
     }
     Ok(())
 }
@@ -421,6 +431,7 @@ fn main() {
             overlay_interactive,
             overlay_backdrop,
             overlay_reset_position,
+            overlay_monitors,
             stage_idle,
             show_main_window,
             hide_main_window,
@@ -455,7 +466,7 @@ fn main() {
             tray::build(&handle)?;
             if let Some(window) = app.get_webview_window("overlay") {
                 overlay::prepare(&window);
-                overlay::place(&window, None);
+                overlay::place(&window, None, None);
             }
             if let Some(window) = app.get_webview_window("stage") {
                 stage::prepare(&window);

@@ -313,7 +313,7 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
         area.position.x + (area.size.width as i32 - (500.0 * primary.scale_factor()).round() as i32) / 2,
         area.position.y + (12.0 * primary.scale_factor()).round() as i32,
     );
-    overlay::place(&window, None);
+    overlay::place(&window, None, None);
     let before = unsafe { GetForegroundWindow() };
     let _ = window.set_position(PhysicalPosition::new(expected.x - 640, expected.y));
     unsafe { PostMessageW(hwnd.0 as _, WM_DISPLAYCHANGE, 32, 0); }
@@ -326,7 +326,7 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     for m in window.available_monitors().unwrap_or_default() {
         let p = m.work_area().position;
         let _ = window.set_position(PhysicalPosition::new(p.x + 40, p.y + 40));
-        overlay::place(&window, None);
+        overlay::place(&window, None, None);
         crosses &= wait_until(Duration::from_secs(3), || window.outer_position().ok() == Some(expected)
             && window.outer_size().ok().is_some_and(|s| s.width == (500.0 * primary.scale_factor()).round() as u32));
     }
@@ -352,6 +352,34 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let cleared = tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(3))).ok()
         .is_some_and(|s| s["prefs"]["overlay"]["position"].is_null());
     report.insert("resetClearsSavedPosition".into(), json!(reset && cleared && window.outer_position().ok() == Some(expected)));
+
+    // The selected monitor travels through the real core preferences event, and reset must
+    // center that monitor rather than unconditionally returning to the primary display.
+    let mut selected_ok = true;
+    let mut selected_reset_ok = true;
+    let focus = unsafe { GetForegroundWindow() };
+    for m in window.available_monitors().unwrap_or_default() {
+        let Some(name) = m.name() else { continue };
+        let area = m.work_area();
+        let centered = PhysicalPosition::new(
+            area.position.x + area.size.width.saturating_sub((500.0 * m.scale_factor()).round() as u32) as i32 / 2,
+            area.position.y + (12.0 * m.scale_factor()).round() as i32,
+        );
+        let changed = tauri::async_runtime::block_on(core.call("prefs_set",
+            json!({"patch": {"overlay": {"monitor": name, "position": null}}}), Duration::from_secs(3)))
+            .is_ok_and(|r| r.get("error").is_none());
+        selected_ok &= changed && wait_until(Duration::from_secs(3), || window.outer_position().ok() == Some(centered)
+            && window.outer_size().ok().is_some_and(|size| size.width == (500.0 * m.scale_factor()).round() as u32));
+        let _ = window.set_position(PhysicalPosition::new(centered.x + 50, centered.y + 30));
+        selected_reset_ok &= tauri::async_runtime::block_on(crate::overlay_reset_position(app.clone())).is_ok()
+            && wait_until(Duration::from_secs(3), || window.outer_position().ok() == Some(centered));
+    }
+    report.insert("selectedMonitorCentersWithItsDpi".into(), json!(selected_ok));
+    report.insert("resetCentersSelectedMonitor".into(), json!(selected_reset_ok));
+    report.insert("selectedMonitorKeepsFocus".into(), json!(unsafe { GetForegroundWindow() } == focus));
+    let _ = tauri::async_runtime::block_on(core.call("prefs_set",
+        json!({"patch": {"overlay": {"monitor": null, "position": null}}}), Duration::from_secs(3)));
+    let _ = tauri::async_runtime::block_on(crate::overlay_reset_position(app.clone()));
 }
 
 /// A controlled window behind main distinguishes real compositor transparency

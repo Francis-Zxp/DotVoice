@@ -3,7 +3,7 @@
 客户端从 `https://api.github.com/repos/Francis-Zxp/DotVoice/releases/latest` 读取正式发行版。推送源码本身不会通知用户；发布完成且有对应 Windows 下载包后才会触发更新提醒。
 
 1. 更新应用版本：Python Core、前端 package.json / mock、Tauri Cargo.toml / Cargo.lock 的 dotvoice 项、tauri.conf.json、build.ps1、package_release.py、安装器。不要替换依赖项的版本。添加本版 `RELEASE_<版本>.md` 并更新打包列表。
-2. 运行 Python、前端、Rust 和相关界面回归；构建后运行 `DotVoice.exe --smoke`。真实设备验收与模拟测试分开记录。
+2. 安装锁定依赖后运行 `tools/collect_licenses.py`，检查第三方版本与原文清单。运行 Python、前端、Rust 和相关界面回归；构建后运行 `DotVoice.exe --smoke`。真实设备验收与模拟测试分开记录。
 3. 运行 `build.ps1` 和 `tools/package_release.py`。确认 Windows ZIP 内 `installed-files.json` 的所有 SHA-256，确认没有 runtime、笔记、密钥、调试录音或用户参考图片。
 4. 推送代码并等待 GitHub Checks 通过。创建版本标签 `v<版本>`，先创建草稿 Release，上传以下三个完整资产，再取消草稿并设为 Latest：
    - `DotVoice-<版本>-windows-x64.zip`

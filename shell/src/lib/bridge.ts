@@ -3,7 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { createMock } from './mock';
-import type { ElevationStatus } from './types';
+import type { ElevationStatus, OverlayMonitor } from './types';
 
 type Handler = (event: string, data: any) => void;
 
@@ -49,6 +49,7 @@ export const shell = {
   overlayInteractive: (rect: { x: number; y: number; width: number; height: number } | null) =>
     shellCommand('overlay_interactive', { rect }),
   overlayResetPosition: () => shellCommand('overlay_reset_position'),
+  overlayMonitors: () => shellCommand<OverlayMonitor[]>('overlay_monitors'),
   showMain: () => shellCommand('show_main_window'),
   hideMain: () => shellCommand('hide_main_window'),
   quit: () => shellCommand('quit_app'),

@@ -21,7 +21,7 @@ DEFAULTS = {
     'mode': 'input',
     'category': 'idea',  # 0.6 leftover; notes now use tags
     'sounds': {'enabled': True, 'volume': 'medium', 'keep_awake': True},
-    'overlay': {'enabled': True, 'on_switch': True, 'linger_seconds': 5, 'position': None},
+    'overlay': {'enabled': True, 'on_switch': True, 'linger_seconds': 5, 'position': None, 'monitor': None},
     # Live words while speaking come from accurate sources only (OpenLess's own stream,
     # the built-in cloud engines). The local preview model's words are often wrong: shown
     # only when asked for. (0.10's preview.enabled is retired: skipped when read.)
@@ -114,6 +114,15 @@ def _text(limit, multiline=False):
     return check
 
 
+def _monitor(value):
+    if value is None:
+        return None
+    value = _text(256)(value)
+    if not value:
+        raise ValueError('显示器名称不能为空')
+    return value
+
+
 def _app_id(value):
     value = _text(20)(value)
     if value and not re.fullmatch(r'\d{4,20}', value):
@@ -169,7 +178,7 @@ SCHEMA = {
     'category': _choice('idea', 'paper'),
     'sounds': {'enabled': _bool, 'volume': _choice('low', 'medium', 'high'), 'keep_awake': _bool},
     'overlay': {'enabled': _bool, 'on_switch': _bool, 'linger_seconds': _int_range(2, 30),
-                'position': _position},
+                'position': _position, 'monitor': _monitor},
     'preview': {'show_local_text': _bool},
     'airmouse': {'enabled': _bool, 'skip_slideshow': _bool},
     'hotkeys': {'toggle_mode': _accelerator, 'arm_toggle': _accelerator},

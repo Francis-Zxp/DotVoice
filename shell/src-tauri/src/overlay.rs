@@ -2,7 +2,7 @@
 //! keeps typing into the user's own edit box. Transparent pixels stay
 //! click-through; only the card rectangle reported by the page is interactive.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +40,29 @@ pub struct OverlayState {
 #[derive(Default)]
 struct PlacementState {
     saved: Option<(i32, i32)>,
+    monitor: Option<String>,
     pending: bool,
     drag_origin: Option<(i32, i32)>,
+}
+
+#[derive(Serialize)]
+pub struct MonitorInfo {
+    name: Option<String>,
+    primary: bool,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+}
+
+pub fn monitors(window: &WebviewWindow) -> Result<Vec<MonitorInfo>, String> {
+    let primary = window.primary_monitor().map_err(|e| e.to_string())?;
+    Ok(window.available_monitors().map_err(|e| e.to_string())?.iter().map(|m| MonitorInfo {
+        name: m.name().filter(|name| !name.trim().is_empty()).cloned(),
+        primary: primary.as_ref().is_some_and(|p| p.position() == m.position() && p.size() == m.size()),
+        width: m.size().width,
+        height: m.size().height,
+        scale_factor: m.scale_factor(),
+    }).collect())
 }
 
 impl OverlayState {
@@ -117,16 +138,33 @@ impl Screen {
     }
 }
 
+/// A manual drag takes priority; an absent selected display temporarily falls back without
+/// changing its identity or saved coordinates, so reconnecting restores the intended screen.
+fn target_screen(monitors: &[(Option<String>, Screen)], primary: Option<Screen>,
+    selected: Option<&str>, saved: Option<(i32, i32)>) -> Option<(Screen, Option<(i32, i32)>)> {
+    if let Some((x, y)) = saved {
+        if let Some((_, screen)) = monitors.iter().find(|(_, screen)| screen.contains_saved(x, y)) {
+            return Some((*screen, saved));
+        }
+    }
+    let chosen = selected.and_then(|selected| monitors.iter()
+        .find(|(name, _)| name.as_deref() == Some(selected)).map(|(_, screen)| *screen));
+    chosen.or(primary).or_else(|| monitors.first().map(|(_, screen)| *screen)).map(|screen| (screen, None))
+}
+
 /// Place using the destination screen's DPI, not the previous screen's width.
-pub fn place(window: &WebviewWindow, saved: Option<(i32, i32)>) {
-    window.app_handle().state::<OverlayState>().placement.lock().unwrap().saved = saved;
-    let monitors = window.available_monitors().unwrap_or_default();
-    let restored = saved.and_then(|(x, y)| monitors.iter()
-        .map(Screen::from_monitor).find(|m| m.contains_saved(x, y)));
-    let target = restored.or_else(|| window.primary_monitor().ok().flatten()
-        .as_ref().map(Screen::from_monitor));
-    let Some(target) = target else { return };
-    let (x, y) = target.position(if restored.is_some() { saved } else { None });
+pub fn place(window: &WebviewWindow, saved: Option<(i32, i32)>, selected: Option<&str>) {
+    {
+        let state = window.app_handle().state::<OverlayState>();
+        let mut placement = state.placement.lock().unwrap();
+        placement.saved = saved;
+        placement.monitor = selected.map(str::to_owned);
+    }
+    let monitors: Vec<_> = window.available_monitors().unwrap_or_default().iter()
+        .map(|m| (m.name().cloned(), Screen::from_monitor(m))).collect();
+    let primary = window.primary_monitor().ok().flatten().as_ref().map(Screen::from_monitor);
+    let Some((target, saved)) = target_screen(&monitors, primary, selected, saved) else { return };
+    let (x, y) = target.position(saved);
     let position = PhysicalPosition::new(x, y);
     if window.outer_position().ok() != Some(position) {
         let _ = window.set_position(position);
@@ -140,11 +178,12 @@ pub fn place(window: &WebviewWindow, saved: Option<(i32, i32)>) {
     }
 }
 
-pub fn update_position(app: &AppHandle, saved: Option<(i32, i32)>) {
+pub fn update_position(app: &AppHandle, saved: Option<(i32, i32)>, selected: Option<&str>) {
     let state = app.state::<OverlayState>();
     let mut placement = state.placement.lock().unwrap();
-    if placement.saved != saved {
+    if placement.saved != saved || placement.monitor.as_deref() != selected {
         placement.saved = saved;
+        placement.monitor = selected.map(str::to_owned);
         placement.pending = true;
         state.reposition.notify_all();
     }
@@ -220,9 +259,10 @@ pub fn start_placement_watch(app: AppHandle) {
                 return;
             }
             let saved = p.saved;
+            let selected = p.monitor.clone();
             drop(p);
             if let Some(window) = handle.get_webview_window("overlay") {
-                place(&window, saved);
+                place(&window, saved, selected.as_deref());
             }
         });
     }).expect("overlay placement thread");
@@ -343,7 +383,7 @@ pub fn start_hit_test(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::Screen;
+    use super::{target_screen, Screen};
 
     fn main_screen() -> Screen {
         Screen { x: 0, y: 0, width: 3840, height: 2088, scale: 1.5 }
@@ -392,5 +432,42 @@ mod tests {
         let screen = Screen { x: 72, y: 48, width: 3768, height: 2040, scale: 1.5 };
         assert_eq!(screen.position(None), (1581, 66));
         assert_eq!(screen.position(Some((0, 0))), (72, 48));
+    }
+
+    #[test]
+    fn named_display_selection_uses_its_own_scale_and_work_area() {
+        let main = main_screen();
+        let portrait = Screen { x: -2160, y: -200, width: 2160, height: 3744, scale: 2.0 };
+        let displays = vec![(Some("main".into()), main), (Some("portrait".into()), portrait)];
+        let (target, saved) = target_screen(&displays, Some(main), Some("portrait"), None).unwrap();
+        assert_eq!(target.size().width, 1000);
+        assert_eq!(target.position(saved), (-1580, -176));
+        let (target, saved) = target_screen(&displays, Some(main), None, None).unwrap();
+        assert_eq!(target.position(saved), (1545, 18));
+    }
+
+    #[test]
+    fn unplug_falls_back_without_losing_the_selected_display_and_replug_restores_it() {
+        let main = main_screen();
+        let laptop = Screen { x: 3840, y: 247, width: 2560, height: 1528, scale: 1.5 };
+        let mut displays = vec![(Some("main".into()), main)];
+        let selected = Some("laptop");
+        let (target, saved) = target_screen(&displays, Some(main), selected, None).unwrap();
+        assert_eq!(target.position(saved), (1545, 18));
+        displays.push((Some("laptop".into()), laptop));
+        let (target, saved) = target_screen(&displays, Some(main), selected, None).unwrap();
+        assert_eq!(target.position(saved), (4745, 265));
+    }
+
+    #[test]
+    fn manual_drag_keeps_priority_and_missing_names_use_primary() {
+        let main = main_screen();
+        let laptop = Screen { x: 3840, y: 247, width: 2560, height: 1528, scale: 1.5 };
+        let displays = vec![(Some("main".into()), main), (Some("laptop".into()), laptop)];
+        let (target, saved) = target_screen(&displays, Some(main), Some("laptop"), Some((200, 80))).unwrap();
+        assert_eq!(target.position(saved), (200, 80));
+        let unnamed = vec![(None, main), (None, laptop)];
+        let (target, saved) = target_screen(&unnamed, Some(main), Some("unavailable"), None).unwrap();
+        assert_eq!(target.position(saved), (1545, 18));
     }
 }

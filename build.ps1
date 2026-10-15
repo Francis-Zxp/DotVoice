@@ -64,6 +64,9 @@ function Clear-BuildOutput([string]$Output, [string]$Backups) {
 # named like a version stay, and so do junctions, a folder DotVoice is running from and one whose
 # DotVoice\runtime holds a portable copy's data.
 function Remove-OldBuilds([string]$DistRoot, [string]$Current) {
+    # Enumeration expands Windows 8.3 aliases; compare the same canonical paths.
+    $DistRoot = (Get-Item -LiteralPath $DistRoot -Force).FullName
+    $Current = (Get-Item -LiteralPath $Current -Force).FullName
     foreach ($old in @(Get-ChildItem -LiteralPath $DistRoot -Directory -Force)) {
         $folder = [IO.Path]::GetFullPath($old.FullName)
         if ($folder -eq $Current -or [IO.Path]::GetDirectoryName($folder) -ne $DistRoot) { continue }

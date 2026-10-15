@@ -1,7 +1,7 @@
 /* Browser-only preview data. Not used inside the app; the UI labels it as a preview. */
 import { keyText } from './engine';
 import { ELEVATION_NOTICE } from './elevation';
-import type { ElevationStatus, EngineInfo, EnginePrefs, HotkeyApp, LiveSource, Mode, Note, PenInstance, SecretName, Snapshot, Tool } from './types';
+import type { ElevationStatus, EngineInfo, EnginePrefs, HotkeyApp, LiveSource, Mode, Note, OverlayMonitor, PenInstance, SecretName, Snapshot, Tool } from './types';
 
 type Handler = (event: string, data: any) => void;
 
@@ -117,7 +117,7 @@ export function createMock() {
     destination: 'input', pending_mode: null, tool: 'laser', preview_available: true, live_text: '',
     prefs: {
       mode: 'input', category: 'idea', sounds: { enabled: true, volume: 'medium', keep_awake: true },
-      overlay: { enabled: true, on_switch: true, linger_seconds: 5, position: null }, preview: { show_local_text: false },
+      overlay: { enabled: true, on_switch: true, linger_seconds: 5, position: null, monitor: null }, preview: { show_local_text: false },
       airmouse: { enabled: true, skip_slideshow: true }, hotkeys: { toggle_mode: '', arm_toggle: '' },
       appearance: { theme: 'system', reduced_motion: false, live_shortcut: true }, present: { tool: 'laser', hide_cursor: true, zoom: 200 },
       voice: { whisper: 'auto', fast_raw: false }, devices: { coexist: true }, pen: { guard_shortcuts: true },
@@ -276,7 +276,11 @@ export function createMock() {
   };
   // What the setup wizard holds right now: test mode and the microphone meter (UI QA).
   const leases = () => ({ testing, meter: meterUntil > Date.now() });
-  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases };
+  const monitors: OverlayMonitor[] = [
+    { name: String.raw`\\.\DISPLAY1`, primary: true, width: 3840, height: 2160, scale_factor: 1.5 },
+    { name: String.raw`\\.\DISPLAY2`, primary: false, width: 2560, height: 1600, scale_factor: 2 },
+  ];
+  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases, monitors };
   const query = params.get('demo');
   const live = params.get('live');  // ?live=remote: the demo session streams accurate words
   if (query === 'input' || query === 'notes') setTimeout(() => play(query, { source: live === 'remote' || live === 'cloud' ? live : 'local' }), 400);
@@ -287,6 +291,12 @@ export function createMock() {
     on(handler: Handler) { handlers.add(handler); return () => handlers.delete(handler); },
     async shell(name: string, args?: Record<string, unknown>) {
       if (name === 'core_ready') return snap;
+      if (name === 'overlay_monitors') return monitors.map(m => ({ ...m }));
+      if (name === 'overlay_reset_position') {
+        snap.prefs = { ...snap.prefs, overlay: { ...snap.prefs.overlay, position: null } };
+        emit('prefs', snap.prefs);
+        return;
+      }
       if (name === 'elevation_status') return { ...elevation };
       if (name === 'elevation_set') {
         // The real shell asks UAC, registers / deletes the logon task and restarts DotVoice.
