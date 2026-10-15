@@ -699,10 +699,7 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
         <Range label="保存后停留" min={2} max={30} value={prefs.overlay.linger_seconds} className="w-[130px]" disabled={!prefs.overlay.enabled}
           onChange={(v) => setPrefs({ overlay: { linger_seconds: v } })} />
       </SettingRow>
-      <SettingRow title="位置" description={monitorError || (missing && !loading
-        ? '所选屏幕未连接，暂用主屏；接回后自动恢复。也可拖动便签调整位置。'
-        : monitors.some(m => !m.name) ? '无名称的屏幕无法单独记住；仍可直接拖动便签到该屏幕。'
-          : '在所选屏幕顶部居中；也可以拖动便签保留手动位置。')}>
+      <SettingRow title="位置">
         <div className="flex max-w-[230px] flex-col items-stretch gap-2">
           <select className="field text-[12px]" aria-label="胶囊显示器" value={selected} disabled={loading || placing}
             onChange={(event) => chooseMonitor(event.target.value)}>
@@ -718,6 +715,10 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
           </div>
         </div>
       </SettingRow>
+      <p className="faint pb-4 text-[12px]">{monitorError || (missing && !loading
+        ? '所选屏幕未连接，暂用主屏；接回后自动恢复。也可拖动便签调整位置。'
+        : monitors.some(m => !m.name) ? '无名称的屏幕无法单独记住；仍可直接拖动便签到该屏幕。'
+          : '在所选屏幕顶部居中；也可以拖动便签保留手动位置。')}</p>
     </Glass>
   );
 }
