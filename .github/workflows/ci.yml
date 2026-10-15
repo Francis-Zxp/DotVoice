@@ -1,0 +1,41 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+      - name: Core regression tests (simulated devices)
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install frontend dependencies
+        run: |
+          npm install --global pnpm@11.2.2
+          pnpm --dir shell install --frozen-lockfile
+      - name: Frontend checks
+        working-directory: shell
+        run: |
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm build

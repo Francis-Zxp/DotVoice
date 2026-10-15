@@ -1,0 +1,75 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DotVoice",
+  "mainBinaryName": "DotVoice",
+  "version": "0.11.5",
+  "identifier": "com.dotvoice.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "点声 DotVoice",
+        "url": "index.html",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 620,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true,
+        "visible": false
+      },
+      {
+        "label": "overlay",
+        "title": "点声 · 灵动胶囊",
+        "url": "overlay.html",
+        "width": 500,
+        "height": 580,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "focus": false
+      },
+      {
+        "label": "stage",
+        "title": "点声 · 演示",
+        "url": "stage.html",
+        "width": 800,
+        "height": 600,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "focus": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/icon.ico"
+    ]
+  }
+}
