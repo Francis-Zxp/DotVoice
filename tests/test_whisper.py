@@ -530,7 +530,7 @@ class PrefsTests(unittest.TestCase):
         events = []
         core = make_core(Path(folder.name), events=events)
         self.addCleanup(core.close)
-        self.assertEqual(core.snapshot()['prefs']['voice'], {'whisper': 'auto', 'fast_raw': False})
+        self.assertEqual(core.snapshot()['prefs']['voice'], {'whisper': 'auto'})
         self.assertEqual(core.controller.whisper_mode, 'auto')
         self.assertEqual(core.prefs_set({'voice': {'whisper': 'on'}})['voice']['whisper'], 'on')
         self.assertEqual(core.controller.whisper_mode, 'on')

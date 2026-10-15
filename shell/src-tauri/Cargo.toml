@@ -1,6 +1,6 @@
 [package]
 name = "dotvoice"
-version = "0.11.5"
+version = "0.11.6"
 description = "点声 DotVoice desktop shell"
 edition = "2021"
 publish = false

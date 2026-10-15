@@ -580,24 +580,6 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(tight.read_bytes(), render('stop', 'low', 0))
             self.assertEqual(again.read_bytes(), render('stop', 'low'))
 
-    def test_a_preview_model_that_fails_to_load_is_announced_once(self):
-        from bridge.preview import LivePreview
-        loads = []
-
-        def broken():
-            loads.append(1)
-            raise RuntimeError('sherpa_onnx missing')
-        events = []
-        preview = LivePreview('unused', lambda k, v: events.append((k, v)), recognizer_factory=broken)
-        self.addCleanup(preview.close)
-        for session in ('s1', 's2', 's3'):
-            preview.start(session)
-            preview.feed(b'\x00\x01' * 800)
-            preview.finish()
-        wait_for(lambda: preview.jobs.empty())
-        time.sleep(.1)
-        self.assertEqual(len(loads), 1, 'not reloaded for every recording')
-        self.assertEqual([k for k, _ in events], ['preview_error'])
 
     def test_sound_log_is_written_by_the_ticker_not_by_the_cue(self):
         with tempfile.TemporaryDirectory() as folder:

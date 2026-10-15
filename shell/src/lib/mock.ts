@@ -1,7 +1,7 @@
 /* Browser-only preview data. Not used inside the app; the UI labels it as a preview. */
 import { keyText } from './engine';
 import { ELEVATION_NOTICE } from './elevation';
-import type { ElevationStatus, EngineInfo, EnginePrefs, HotkeyApp, LiveSource, Mode, Note, OverlayMonitor, PenInstance, SecretName, Snapshot, Tool } from './types';
+import type { ElevationStatus, EngineInfo, EnginePrefs, HotkeyApp, LiveSource, Mode, Note, OverlayEnvelope, OverlayLayout, OverlayMonitor, PenInstance, SecretName, Snapshot, Tool } from './types';
 
 type Handler = (event: string, data: any) => void;
 
@@ -90,7 +90,7 @@ export function createMock() {
   let meterTimer = 0;
   let meterUntil = 0;
   const snap: Snapshot = {
-    version: '0.11.5-preview',
+    version: '0.11.6-preview',
     state: { phase: 'disconnected', message: '', armed: false },
     result: null,
     usage: {
@@ -114,13 +114,13 @@ export function createMock() {
     tidepool: noDevices
       ? { installed: true, receiver_running: true, receiver_version: '4.0.5', control_supported: true, device_online: false, usb_connected: false, link: 'unknown', enabled: true, battery_percent: null, message: '预览数据：接收器在线，设备未连接' }
       : { installed: true, receiver_running: true, receiver_version: '4.0.5', control_supported: true, device_online: true, usb_connected: false, link: '无线', enabled: true, battery_percent: null, message: '预览数据：接收器在线，设备无线连接' },
-    destination: 'input', pending_mode: null, tool: 'laser', preview_available: true, live_text: '',
+    destination: 'input', pending_mode: null, tool: 'laser', live_text: '',
     prefs: {
       mode: 'input', category: 'idea', sounds: { enabled: true, volume: 'medium', keep_awake: true },
-      overlay: { enabled: true, on_switch: true, linger_seconds: 5, position: null, monitor: null }, preview: { show_local_text: false },
+      overlay: { enabled: true, on_switch: true, linger_seconds: 5, position: null, monitor: null, all_monitors: false, anchor: 'top-center', positions: {} },
       airmouse: { enabled: true, skip_slideshow: true }, hotkeys: { toggle_mode: '', arm_toggle: '' },
       appearance: { theme: 'system', reduced_motion: false, live_shortcut: true }, present: { tool: 'laser', hide_cursor: true, zoom: 200 },
-      voice: { whisper: 'auto', fast_raw: false }, devices: { coexist: true }, pen: { guard_shortcuts: true },
+      voice: { whisper: 'auto' }, devices: { coexist: true }, pen: { guard_shortcuts: true },
       diagnostics: { save_audio: false },
       general: { run_elevated: false },
       engine: {
@@ -208,9 +208,8 @@ export function createMock() {
   };
   let timers: number[] = [];
   const later = (ms: number, fn: () => void) => timers.push(window.setTimeout(fn, ms));
-  /* A demo session. Its live words come from `source`: 'local' (the default, like the
-     preview model; hidden unless 显示本机预览文字 is on) or 'remote' / 'cloud'. */
-  function play(kind: 'input' | 'notes', { source = 'local' }: { source?: LiveSource } = {}) {
+  /* A demo session. With no streaming source, only the waveform appears until the result. */
+  function play(kind: 'input' | 'notes', { source }: { source?: LiveSource } = {}) {
     timers.forEach(clearTimeout); timers = [];
     if (snap.destination !== kind) setMode(kind, 'key');
     if (snap.state.phase === 'disconnected') state('idle', '连接成功');
@@ -280,20 +279,34 @@ export function createMock() {
     { name: String.raw`\\.\DISPLAY1`, primary: true, width: 3840, height: 2160, scale_factor: 1.5 },
     { name: String.raw`\\.\DISPLAY2`, primary: false, width: 2560, height: 1600, scale_factor: 2 },
   ];
-  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases, monitors };
+  const shellHandlers = new Map<string, Set<(data: any) => void>>();
+  const shellEmit = (event: string, data: any) => shellHandlers.get(event)?.forEach(handler => handler(data));
+  const layout: OverlayLayout = { anchor: 'top-center', controller: params.get('mirror') !== '1', active: true, monitor: monitors[0].name };
+  let overlayCache: OverlayEnvelope | null = null;
+  let overlaySeq = 0;
+  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases, monitors, layout, shellEmit };
   const query = params.get('demo');
   const live = params.get('live');  // ?live=remote: the demo session streams accurate words
-  if (query === 'input' || query === 'notes') setTimeout(() => play(query, { source: live === 'remote' || live === 'cloud' ? live : 'local' }), 400);
+  if (query === 'input' || query === 'notes') setTimeout(() => play(query, { source: live === 'remote' || live === 'cloud' ? live : undefined }), 400);
   if (query === 'switch') setTimeout(() => setMode(MODES[(MODES.indexOf(snap.destination) + 1) % MODES.length], 'key'), 400);
   if (query === 'present') setTimeout(() => { setMode('present', 'key'); later(2200, () => setTool('spotlight')); }, 400);
 
   return {
     on(handler: Handler) { handlers.add(handler); return () => handlers.delete(handler); },
+    onOverlay(event: string, handler: (data: any) => void) {
+      if (!shellHandlers.has(event)) shellHandlers.set(event, new Set());
+      shellHandlers.get(event)!.add(handler);
+      return () => { shellHandlers.get(event)?.delete(handler); };
+    },
     async shell(name: string, args?: Record<string, unknown>) {
       if (name === 'core_ready') return snap;
+      if (name === 'overlay_layout') return { ...layout };
+      if (name === 'overlay_snapshot') return overlayCache;
+      if (name === 'overlay_publish') { overlayCache = { seq: ++overlaySeq, model: args?.model }; return overlayCache; }
+      if (name === 'overlay_action') { shellEmit('overlay://action', args?.action); return; }
       if (name === 'overlay_monitors') return monitors.map(m => ({ ...m }));
       if (name === 'overlay_reset_position') {
-        snap.prefs = { ...snap.prefs, overlay: { ...snap.prefs.overlay, position: null } };
+        snap.prefs = { ...snap.prefs, overlay: { ...snap.prefs.overlay, position: null, positions: {} } };
         emit('prefs', snap.prefs);
         return;
       }
@@ -375,6 +388,11 @@ export function createMock() {
             return { error: '润色：Base URL 无效，应以 https:// 开头（例如 https://api.example.com/v1）' };
           }
           merge(updated, patch);
+          if (patch.overlay?.positions) updated.overlay.positions = patch.overlay.positions;
+          if (patch.overlay?.anchor) {
+            layout.anchor = patch.overlay.anchor;
+            shellEmit('overlay://layout', { ...layout });
+          }
           if (patch.engine) {
             const before = snap.prefs.engine!, after = updated.engine!;
             const running = (engine: EnginePrefs) => { const { suggest_volc: _hint, ...info } = engineInfo(engine); return JSON.stringify(info); };

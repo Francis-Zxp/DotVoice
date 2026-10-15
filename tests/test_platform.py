@@ -83,7 +83,7 @@ class PrefsTests(unittest.TestCase):
             path = Path(folder) / 'prefs.json'
             prefs = Preferences(path, [{'overlay': {'enabled': False}}])
             self.assertFalse(prefs.get('overlay', 'enabled'))
-            prefs.update({'preview': {'show_local_text': True}, 'mode': 'present'})
+            prefs.update({'overlay': {'all_monitors': True}, 'mode': 'present'})
             for bad in ({'unknown': 1}, {'preview': {'show_local_text': 1}}, {'mode': 'other'},
                         {'sounds': {'enabled': 'yes'}}, {'preview': {'enabled': True}}):
                 with self.assertRaises(ValueError):
@@ -94,7 +94,7 @@ class PrefsTests(unittest.TestCase):
             saved['notes'] = {'pause_ms': 700}  # a removed 0.7 setting is skipped, not fatal
             path.write_text(json.dumps(saved), encoding='utf-8')
             again = Preferences(path)
-            self.assertTrue(again.get('preview', 'show_local_text'))
+            self.assertTrue(again.get('overlay', 'all_monitors'))
             self.assertEqual(again.get('sounds', 'volume'), 'medium')
 
 

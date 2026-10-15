@@ -1,7 +1,7 @@
 /* Capsule behaviour as a pure reducer. Timers are requested through
    `timer` + `token`; the component schedules them and echoes the token back. */
-import { liveTextShown, nextLive } from '../lib/liveText';
-import type { LiveSource, Mode, Phase, Tool } from '../lib/types';
+import { asSource, liveTextShown, nextLive } from '../lib/liveText';
+import type { LiveSource, Mode, Phase, Snapshot, Tool } from '../lib/types';
 
 export type View = 'hidden' | 'chip' | 'live' | 'note';
 /* elevated: an administrator window dropped a click / scroll (said once per window);
@@ -27,7 +27,7 @@ export interface Model {
   source: LiveSource | null; // who wrote the live text
   final: boolean;        // text is the final result
   savedAt: number | null;
-  fast?: boolean;            // the text was typed by 极速落字 (local recognition)
+  envelope?: number[];        // bounded result waveform, shared with newly attached screens
   external?: string;         // the hotkey bridge handed the session to this app (it typed the text)
   done: boolean;
   pinned: boolean;
@@ -35,15 +35,16 @@ export interface Model {
   enabled: boolean;
   onSwitch: boolean;
   linger: number;
-  showLocal: boolean;    // prefs preview.show_local_text: the local preview's words may show
   blockedLater?: boolean;    // an 'elevated' notice came mid-session: shown once the session card goes
   timer: { ms: number; then: 'hide' | 'collapse' } | null;
   token: number;
 }
 
 export type Event =
-  | { type: 'config'; enabled: boolean; onSwitch: boolean; linger: number; showLocal?: boolean }
+  | { type: 'config'; enabled: boolean; onSwitch: boolean; linger: number }
   | { type: 'init'; mode: Mode; pending: Mode | null; armed: boolean; phase: Phase; tool: Tool }
+  | { type: 'snapshot'; snapshot: Pick<Snapshot, 'destination' | 'pending_mode' | 'armed' | 'state' | 'tool' | 'live_text' | 'live_source'>;
+      seen: { mode: boolean; state: boolean; tool: boolean; partial: boolean }; at: number }
   | { type: 'mode'; value: Mode; pending: Mode | null; armed: boolean; source: string; tool?: Tool }
   | { type: 'tool'; tool: Tool }
   | { type: 'state'; phase: Phase; armed?: boolean; message?: string; at: number; destination?: 'input' | 'notes'; whisper?: boolean }
@@ -53,22 +54,22 @@ export type Event =
   | { type: 'failed'; message: string }
   | { type: 'elevated' }
   | { type: 'partial'; text: string; source?: string }
-  | { type: 'result'; destination: Mode; text: string; at: number; skipped?: boolean; empty?: boolean; noteError?: boolean; local?: boolean; external?: string; notTyped?: boolean; copied?: boolean }
+  | { type: 'result'; destination: Mode; text: string; at: number; skipped?: boolean; empty?: boolean; noteError?: boolean; envelope?: number[]; external?: string; notTyped?: boolean; copied?: boolean }
   | { type: 'timeout'; token: number }
-  | { type: 'pin' }
-  | { type: 'dismiss' };
+  | { type: 'pin'; value?: boolean; expected?: { session: number | null; token: number } }
+  | { type: 'dismiss'; expected?: { session: number | null; token: number } };
 
 export const initial: Model = {
   view: 'hidden', mode: 'input', pending: null, tool: 'mouse', armed: false, phase: 'disconnected', chip: null,
   sessionMode: 'input', startedAt: null, text: '', source: null, final: false, savedAt: null, done: false, pinned: false,
-  whisper: false, enabled: true, onSwitch: true, linger: 5, showLocal: false, timer: null, token: 0,
+  whisper: false, enabled: true, onSwitch: true, linger: 5, timer: null, token: 0,
 };
 
 /* The words the capsule may show now: the final result, or live words from a source
    the user trusts (lib/liveText). '' while live = the waveform-only listening state. */
 export function shownText(model: Model): string {
   if (model.final) return model.text;
-  return model.text && liveTextShown(model.source, model.showLocal) ? model.text : '';
+  return model.text && liveTextShown(model.source) ? model.text : '';
 }
 
 const BUSY: Phase[] = ['starting', 'recording', 'processing'];
@@ -98,13 +99,29 @@ function chip(model: Model, kind: ChipKind, mode: Mode, pending = false, text = 
 }
 
 export function reduce(model: Model, event: Event): Model {
+  // The guard belongs in the reducer: a newer core event may already be queued in
+  // the same React batch even though the last rendered mirror still has an old token.
+  if ('expected' in event && event.expected && (model.view !== 'note'
+    || event.expected.session !== model.startedAt || event.expected.token !== model.token)) return model;
   switch (event.type) {
     case 'config': {
-      const next = { ...model, enabled: event.enabled, onSwitch: event.onSwitch, linger: event.linger, showLocal: event.showLocal ?? model.showLocal };
+      const next = { ...model, enabled: event.enabled, onSwitch: event.onSwitch, linger: event.linger };
       return event.enabled ? next : hide(next);
     }
     case 'init':
       return { ...model, mode: event.mode, pending: event.pending, armed: event.armed, phase: event.phase, tool: event.tool };
+    case 'snapshot': {
+      const { snapshot: s, seen, at } = event;
+      let next = { ...model, mode: seen.mode ? model.mode : s.destination, pending: seen.mode ? model.pending : s.pending_mode,
+        armed: seen.state || seen.mode ? model.armed : s.armed, tool: seen.tool ? model.tool : s.tool ?? 'laser' };
+      if (seen.state) return next;
+      // A late-loaded controller can already have a partial, without having received
+      // the initial recording event. Restore the session without dropping that text.
+      if (s.state.phase === 'processing' && !isBusy(next.phase)) next = reduce(next, { type: 'state', phase: 'starting', destination: s.state.destination, at });
+      next = reduce(next, { type: 'state', ...s.state, at });
+      return isBusy(s.state.phase) ? { ...next, text: seen.partial ? model.text : s.live_text ?? '',
+        source: seen.partial ? model.source : asSource(s.live_source) } : next;
+    }
     case 'mode': {
       const next = { ...model, mode: event.value, pending: event.pending, armed: event.armed, tool: event.tool ?? model.tool };
       if (!model.enabled || !model.onSwitch) return next;
@@ -127,7 +144,7 @@ export function reduce(model: Model, event: Event): Model {
         // boosting began) is the same session, also when its card was dismissed.
         const fresh = !isBusy(model.phase) || model.done;
         const sessionMode = fresh ? sessionLook(event.destination, model.mode) : model.sessionMode;
-        if (fresh) next = { ...next, text: '', source: null, final: false, done: false, savedAt: null, sessionMode, startedAt: null, whisper: false, fast: false, external: undefined };
+        if (fresh) next = { ...next, text: '', source: null, final: false, done: false, savedAt: null, sessionMode, startedAt: null, whisper: false, envelope: undefined, external: undefined };
         // Whisper is a property of the session: a later event may confirm it; an omitted flag keeps it.
         next = { ...next, whisper: event.whisper ?? next.whisper };
         if (!fresh && model.view === 'hidden') return still(next);  // dismissed: stays out of the way
@@ -178,8 +195,7 @@ export function reduce(model: Model, event: Event): Model {
       return chip({ ...model, blockedLater: false }, 'elevated', model.mode, false, '', 5200);
     }
     case 'partial': {
-      // Everything is kept (with its source); shownText decides what may be seen, so the
-      // switch can change mid-session. An accurate stream is never overwritten by a late local guess.
+      // Ignore retired preview sources; only the selected recognizer can update the text.
       if (model.final) return model;
       const current = { text: model.text, source: model.source };
       const live = nextLive(current, event.text, event.source);
@@ -196,7 +212,7 @@ export function reduce(model: Model, event: Event): Model {
       if (event.noteError && event.destination === 'notes') {
         return chip({ ...model, done: true, pinned: false, text: event.text, final: true, savedAt: null }, 'unsaved', 'notes', false, '', 4200);
       }
-      const next = { ...model, done: true, text: event.text, final: true, savedAt: event.at, fast: !!event.local, external: event.external };
+      const next = { ...model, done: true, text: event.text, final: true, savedAt: event.at, envelope: event.envelope?.slice(0, 600), external: event.external };
       if (event.notTyped && event.destination !== 'notes') {
         // Never "已输入到光标处": the text did not arrive. It is kept (clipboard, main window).
         return chip({ ...next, blockedLater: false }, 'kept', model.mode, false, event.copied ? 'copied' : '', 6000);
@@ -215,7 +231,8 @@ export function reduce(model: Model, event: Event): Model {
       return hide(model);
     }
     case 'pin': {
-      const pinned = !model.pinned;
+      const pinned = event.value ?? !model.pinned;
+      if (pinned === model.pinned) return model;
       const next = { ...model, pinned };
       return pinned ? still(next) : model.done ? arm(next, model.linger * 1000, 'collapse') : next;
     }

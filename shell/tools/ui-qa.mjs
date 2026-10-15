@@ -20,7 +20,7 @@ const results = [];
 const check = async (name, fn) => {
   try { await fn(); results.push(['PASS', name]); } catch (error) { results.push(['FAIL', name, error.message.split('\n')[0]]); }
 };
-const reducedPrefs = `{mode:'input',category:'idea',sounds:{enabled:true,volume:'medium'},overlay:{enabled:true,on_switch:true,linger_seconds:30,position:null},preview:{show_local_text:false},airmouse:{enabled:true,skip_slideshow:true},hotkeys:{toggle_mode:'',arm_toggle:''},appearance:{theme:'system',reduced_motion:true}}`;
+const reducedPrefs = `{mode:'input',category:'idea',sounds:{enabled:true,volume:'medium'},overlay:{enabled:true,on_switch:true,linger_seconds:30,position:null},airmouse:{enabled:true,skip_slideshow:true},hotkeys:{toggle_mode:'',arm_toggle:''},appearance:{theme:'system',reduced_motion:true}}`;
 // Mid-recording in the mock's demo session (recording from 2.1 s, words every 110 ms from 2.4 s).
 const MID_RECORDING_MS = 4200;
 const PAGES = [['语音', 'voice'], ['笔记', 'notes'], ['设备', 'devices'], ['续航', 'battery'], ['设置', 'settings']];
@@ -176,7 +176,7 @@ try {
   });
 
   await check('local preview words stay hidden: the voice page shows the voice line, then the final text', async () => {
-    await page.evaluate(() => (window).__demo.play('notes'));  // the mock's words come from the local preview
+    await page.evaluate(() => (window).__demo.play('notes'));  // no streaming source configured
     await page.locator('main [data-wave-only]').waitFor({ timeout: 6000 });
     await page.waitForTimeout(MID_RECORDING_MS - 2100);
     const text = await page.locator('main').innerText();
@@ -417,16 +417,15 @@ try {
     console.log(`  contrast text/glyph: ${found.join(', ')}`);
   });
 
-  await check('new preferences are wired: 气声识别, 随拿随用, 拦截放映快捷键, 桌面图标状态点, 显示本机预览文字, 调试录音', async () => {
+  await check('new preferences are wired: 气声识别, 随拿随用, 拦截放映快捷键, 桌面图标状态点, 在线文字与调试录音', async () => {
     const prefs = () => page.evaluate(() => window.__demo.snap.prefs);
     const whisper = page.locator('[role="group"][aria-label="气声识别"]');
     await whisper.getByRole('button', { name: '始终' }).click();
     await page.waitForFunction(() => window.__demo.snap.prefs.voice.whisper === 'on');
     assert.equal(await whisper.getByRole('button', { name: '始终' }).getAttribute('aria-pressed'), 'true');
-    assert.equal(await page.getByRole('switch', { name: '显示本机预览文字' }).isChecked(), false, 'local preview words are off by default');
+    assert.equal(await page.getByRole('switch', { name: /显示本机预览文字|原文极速落字/ }).count(), 0, 'retired local recognition controls are absent');
     assert.equal(await page.getByRole('switch', { name: '实时预览文字' }).count(), 0, 'one live-text switch, not two');
-    for (const [label, read] of [['随拿随用', (p) => p.devices.coexist], ['拦截笔的放映快捷键', (p) => p.pen.guard_shortcuts], ['桌面图标实时状态点', (p) => p.appearance.live_shortcut],
-      ['显示本机预览文字', (p) => p.preview.show_local_text], ['显示本机预览文字', (p) => p.preview.show_local_text]]) {
+    for (const [label, read] of [['随拿随用', (p) => p.devices.coexist], ['拦截笔的放映快捷键', (p) => p.pen.guard_shortcuts], ['桌面图标实时状态点', (p) => p.appearance.live_shortcut]]) {
       const before = read(await prefs());
       await page.getByRole('switch', { name: label }).click();
       await page.waitForTimeout(200);
@@ -789,8 +788,8 @@ try {
     await overlay.screenshot({ path: resolve(shots, 'capsule-kept.png'), clip: { x: 0, y: 0, width: 500, height: 110 } });
     await overlay.locator('.capsule').waitFor({ state: 'detached', timeout: 9000 });
   });
-  await check('note session: a waveform-only note (local guesses hidden), then the saved text', async () => {
-    await overlay.evaluate(() => (window).__demo.play('notes'));  // the mock's words come from the local preview
+  await check('note session: a waveform-only note without streaming words, then the saved text', async () => {
+    await overlay.evaluate(() => (window).__demo.play('notes'));  // no streaming source configured
     await overlay.locator('.capsule.view-note [data-wave-only]').waitFor({ timeout: 8000 });
     await overlay.waitForTimeout(MID_RECORDING_MS - 1800);
     const text = await overlay.locator('.capsule').innerText();
@@ -817,17 +816,16 @@ try {
     assert.ok(done.width > 340 && done.height < 80, `result capsule ${done.width}×${done.height}`);
     await overlay.screenshot({ path: resolve(shots, 'capsule-input-done.png') });
   });
-  await check('accurate words show in the capsule; the switch reveals local guesses', async () => {
+  await check('online input and note streams show in the capsule', async () => {
     await overlay.evaluate(() => (window).__demo.play('input', { source: 'remote' }));
     await overlay.waitForFunction(() => document.querySelector('.capsule .live-tail')?.textContent?.includes('读取'), null, { timeout: 12000 });
     assert.equal(await overlay.locator('.capsule [data-wave-only]').count(), 0);
     await overlay.screenshot({ path: resolve(shots, 'capsule-input-live.png') });
     await overlay.locator('.capsule', { hasText: '已输入到光标处' }).waitFor({ timeout: 10000 });
-    await overlay.evaluate(`window.__demo.emit('prefs', ${reducedPrefs.replace('show_local_text:false', 'show_local_text:true')})`);
-    await overlay.evaluate(() => (window).__demo.play('notes'));
+    await overlay.evaluate(() => (window).__demo.play('notes', { source: 'cloud' }));
     await overlay.waitForFunction(() => document.querySelector('.capsule')?.textContent?.includes('今天想把点声'), null, { timeout: 12000 });
-    assert.ok((await overlay.locator('.capsule').innerText()).includes('本机预览，可能不准'));
-    await overlay.screenshot({ path: resolve(shots, 'capsule-note-local.png') });
+    assert.ok((await overlay.locator('.capsule').innerText()).includes('实时文字 · 结束后定稿'));
+    await overlay.screenshot({ path: resolve(shots, 'capsule-note-cloud.png') });
     await overlay.evaluate(`window.__demo.emit('prefs', ${reducedPrefs})`);
     await overlay.locator('.capsule', { hasText: '已保存' }).waitFor({ timeout: 12000 });
   });

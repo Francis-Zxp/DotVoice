@@ -8,7 +8,7 @@ import zipfile
 
 root = Path(__file__).resolve().parents[1]
 out = root / 'release'
-version = '0.11.5'
+version = '0.11.6'
 portable = out / f'DotVoice-{version}-windows-x64.zip'
 source = out / f'DotVoice-{version}-source.zip'
 SKIP_DIRS = {'__pycache__', 'references', 'device-refs', 'backups', 'runtime', 'node_modules', 'target', 'dist', 'gen', '.venv', '.git'}
@@ -36,10 +36,10 @@ def skipped(relative):
 
 def source_entries():
     files = ['core_main.py', 'config.json', 'requirements.txt', 'requirements-build.txt', 'build.ps1',
-             'README.md', 'VALIDATION.md', 'ACCEPTANCE.md', 'RELEASE_0.9.6.md', 'RELEASE_0.11.5.md', '.gitignore', 'LICENSE',
+             'README.md', 'VALIDATION.md', 'ACCEPTANCE.md', 'RELEASE_0.9.6.md', 'RELEASE_0.11.5.md', 'RELEASE_0.11.6.md', '.gitignore', 'LICENSE',
              'THIRD_PARTY_PV60.md', 'RELEASING.md', '.gitattributes']
     entries = [(root / name, Path('DotVoice-source') / name) for name in files]
-    for folder in ['bridge', 'shell', 'tests', 'tools', 'design', 'licenses', 'integrations', 'installer', 'models', '.github']:
+    for folder in ['bridge', 'shell', 'tests', 'tools', 'design', 'licenses', 'integrations', 'installer', '.github']:
         entries += [(p, Path('DotVoice-source') / p.relative_to(root)) for p in (root / folder).rglob('*')
                     if p.is_file() and not skipped(p.relative_to(root)) and p.suffix not in ('.jsonl', '.log')]
     return entries
@@ -82,8 +82,7 @@ def recycle(paths):
 def main():
     out.mkdir(exist_ok=True)
     base = root / 'dist' / version / 'DotVoice'
-    required = [base / 'DotVoice.exe', base / 'core' / 'dotvoice-core.exe', base / 'installed-files.json',
-                base / 'models' / 'sherpa-zh-14M' / 'encoder-epoch-99-avg-1.int8.onnx']
+    required = [base / 'DotVoice.exe', base / 'core' / 'dotvoice-core.exe', base / 'installed-files.json']
     missing = [str(p) for p in required if not p.is_file()]
     if missing or not (base / 'core' / '_internal').is_dir():
         raise RuntimeError('Release folder is incomplete; refusing to publish: ' + ', '.join(missing))

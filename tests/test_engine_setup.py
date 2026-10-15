@@ -384,18 +384,6 @@ class EngineSwapTests(TempCase):
         self.assertEqual(core.controller.backend.profile.style, 'hold')
         self.assertEqual(core.engine_view()['label'], '自定义快捷键')
 
-    def test_fast_raw_only_ever_stands_in_for_openless(self):
-        core = self.core(engine_factory=self.factory)
-        core.openless.mode = lambda: 'raw'
-        core.prefs_set({'voice': {'fast_raw': True}})
-        self.assertTrue(core._fast_raw())
-        core.prefs_set({'engine': {'kind': 'volc'}})
-        self.assertFalse(core._fast_raw())
-        control = Controller(lambda *event: None, LabelledBackend(), FakeCapture)
-        self.addCleanup(control.close)
-        control.preview, control.fast = type('Ready', (), {'ready': True})(), lambda: True
-        control.session_destination = 'input'
-        self.assertFalse(control._fast_wanted(), 'a cloud engine never takes the local shortcut')
 
 
 class PrefsRecoveryTests(TempCase):
@@ -756,19 +744,15 @@ class WizardTests(TempCase):
         test = self.emitted('wizard_result')[-1]
         self.assertEqual((test['external'], test['app'], test['test']), (True, 'Typeless', True))
 
-    def test_test_mode_lapses_by_itself_and_skips_the_local_shortcut(self):
+    def test_test_mode_lapses_by_itself_and_does_not_insert(self):
         backend = FakeBackend()
         control = Controller(lambda *value: None, backend, FakeCapture)
         self.addCleanup(control.close)
-        control.preview, control.fast = type('Ready', (), {'ready': True, 'start': lambda *a: None,
-                                                           'feed': lambda *a: None, 'cancel': lambda *a: None,
-                                                           'finish': lambda *a: None})(), lambda: True
         control.test_mode(True)
         self.arm(control)
         control.command('start')
         wait_for(lambda: control.phase == 'recording')
         self.assertTrue(control.session_test)
-        self.assertFalse(control.session_fast, '极速落字 would type: a test never takes it')
         self.assertIn('start', backend.calls)
         self.assertFalse(backend.insert_text)
         control.test_mode(True, seconds=0.05)

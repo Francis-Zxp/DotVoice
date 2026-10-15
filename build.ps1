@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $env:PYTHONPATH = ''
-$version = '0.11.5'
+$version = '0.11.6'
 $output = Join-Path $PSScriptRoot "dist\$version"
 $distRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'dist'))
 $output = [IO.Path]::GetFullPath($output)
@@ -96,7 +96,7 @@ Clear-BuildOutput $output (Join-Path $PSScriptRoot 'backups')
 & .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --console --name dotvoice-core `
     --distpath (Join-Path $output 'core-build') --workpath build\core --specpath build\core `
     --additional-hooks-dir tools\hooks --hidden-import hid --copy-metadata hidapi `
-    --collect-binaries sherpa_onnx --collect-submodules sherpa_onnx --exclude-module numpy `
+    --exclude-module sherpa_onnx --exclude-module pypinyin --exclude-module numpy `
     --exclude-module webview --exclude-module clr --exclude-module pythonnet --exclude-module tkinter `
     --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 --exclude-module PySide6 `
     core_main.py
@@ -117,13 +117,8 @@ Move-Item -LiteralPath (Join-Path $output 'core-build\dotvoice-core') -Destinati
 $coreBuild = [IO.Path]::GetFullPath((Join-Path $output 'core-build'))
 if ([IO.Path]::GetDirectoryName($coreBuild) -ne $output) { throw 'Core build path is invalid' }
 Remove-Item -LiteralPath $coreBuild -Recurse -Force
-Copy-Item config.json,README.md,VALIDATION.md,ACCEPTANCE.md,RELEASE_0.11.5.md,LICENSE,THIRD_PARTY_PV60.md -Destination $app
+Copy-Item config.json,README.md,VALIDATION.md,ACCEPTANCE.md,RELEASE_0.11.6.md,LICENSE,THIRD_PARTY_PV60.md -Destination $app
 Copy-Item -LiteralPath licenses -Destination $app -Recurse -Force
-Copy-Item -LiteralPath models -Destination $app -Recurse -Force
-# The live-preview model must load inside the frozen core (native DLLs included).
-$check = & (Join-Path $app 'core\dotvoice-core.exe') --check-preview 2>$null
-if ($LASTEXITCODE -ne 0) { throw "Live preview check failed: $check" }
-Write-Output "Preview check: $check"
 $integration = Join-Path $app 'integrations\tidepool'
 New-Item -ItemType Directory -Path (Join-Path $integration 'receiver') -Force | Out-Null
 Copy-Item -LiteralPath 'integrations\tidepool\install-control.ps1','integrations\tidepool\README.md' -Destination $integration

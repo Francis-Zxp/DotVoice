@@ -218,7 +218,7 @@ export function ReminderBanner() {
           <span className="banner-ico" data-tone="ok"><Sparkles size={15} /></span>
           <span className="flex-1">{reminder.kind === 'released'
             ? `OpenLess ${reminder.version ?? ''} 已包含实时文字支持：升级 OpenLess 后，点声录音时会显示与最终结果同一引擎的实时文字。`
-            : 'OpenLess 关闭了实时文字的合并请求；点声录音时继续只显示声线，需要时可在设置里打开本机预览文字。'}</span>
+            : 'OpenLess 暂未支持远程实时文字；录音时显示声线，说完后显示定稿。'}</span>
           <button className="btn btn-sm" onClick={() => act('open_url', { url: reminder.url })}>查看</button>
           <button className="btn btn-ghost btn-sm" onClick={dismiss}>知道了</button>
         </motion.div>

@@ -68,6 +68,10 @@ export function LiveWave({ width, height, state, tone, onColor = false, reduced,
 
     const draw = (now: number) => {
       raf = 0;
+      if (document.hidden) return;
+      // Several monitors may show the same session. Keep canvas paints at 30 fps,
+      // independent of each display's refresh rate.
+      if (now - last < 1000 / 30) { raf = requestAnimationFrame(draw); return; }
       const dt = Math.min(.05, (now - last) / 1000);
       last = now;
       // Levels arrive at ~10 Hz; if they stop, the voice has stopped.
@@ -126,7 +130,12 @@ export function LiveWave({ width, height, state, tone, onColor = false, reduced,
       if (moving) raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
-    return () => { cancelAnimationFrame(raf); cancelAnimationFrame(reread); };
+    const visibility = () => {
+      if (document.hidden) { cancelAnimationFrame(raf); raf = 0; }
+      else if (!raf) { last = performance.now() - 34; raf = requestAnimationFrame(draw); }
+    };
+    document.addEventListener('visibilitychange', visibility);
+    return () => { cancelAnimationFrame(raf); cancelAnimationFrame(reread); document.removeEventListener('visibilitychange', visibility); };
   }, [width, height, state, tone, onColor, reduced]);
 
   return <canvas ref={ref} aria-hidden="true" className={className} style={{ width, height, display: 'block' }} />;

@@ -50,11 +50,9 @@ interface Store {
   tidepool: Tidepool;
   result: Result | null;
   liveText: string;
-  /** Who wrote liveText; pages show it through lib/liveText (local words only on request). */
+  /** Who wrote liveText; pages show it through lib/liveText. */
   liveSource: LiveSource | null;
   liveFinal: boolean;
-  previewAvailable: boolean;
-  previewRefiner: 'sense_voice' | 'paraformer' | null;
   reminder: Reminder | null;
   appUpdate: AppUpdate | null;
   notes: Note[];
@@ -113,8 +111,6 @@ export const useStore = create<Store>((set, get) => ({
   liveText: '',
   liveSource: null,
   liveFinal: false,
-  previewAvailable: false,
-  previewRefiner: null,
   reminder: null,
   appUpdate: null,
   notes: [],
@@ -193,8 +189,6 @@ export const useStore = create<Store>((set, get) => ({
       result: s.result,
       liveText: s.live_text ?? '',
       liveSource: s.live_text ? asSource(s.live_source) : null,
-      previewAvailable: !!s.preview_available,
-      previewRefiner: s.preview_refiner ?? null,
       reminder: s.reminder ?? null,
       appUpdate: s.app_update ?? null,
       airmouseActive: s.airmouse_active,
@@ -279,7 +273,6 @@ function handle(event: string, data: any) {
       useStore.setState({ meter: data });
       break;
     case 'notice':
-    case 'preview_error':
       store.notify(String(data), 'info');
       break;
     case 'usage':

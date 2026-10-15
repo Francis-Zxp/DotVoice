@@ -18,18 +18,19 @@ import {
   AppWindow, Copy, Crosshair, FlaskConical, Hand, Keyboard, Mic, MicOff, MousePointer2, NotebookPen, Pin, PinOff, Presentation,
   Search, ShieldAlert, Sun, TriangleAlert, Wind, X,
 } from 'lucide-react';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { VoiceScore } from '../components/VoiceScore';
-import { call, inTauri, isMock, onCore, shell } from '../lib/bridge';
+import { call, inTauri, isMock, shell } from '../lib/bridge';
 import { blockedChip } from '../lib/elevation';
 import { clock, timer } from '../lib/format';
 import { handedTo } from '../lib/engine';
-import { isAccurate } from '../lib/liveText';
-import { levels, MODE_INFO, pushLevel, TOOL_INFO } from '../lib/store';
+import { levels, MODE_INFO, TOOL_INFO } from '../lib/store';
 import type { Mode, Snapshot, Tool } from '../lib/types';
 import { captureBackdrop, paintPreviewDesktop, sampleTone, type Tone } from './backdrop';
 import { LiveWave } from './LiveWave';
-import { initial, reduce, shownText, type Model } from './machine';
+import { shownText, type Model } from './machine';
+import { alignment, cardPosition } from './layout';
+import { useOverlayModel } from './useOverlayModel';
 
 const MODE_ICON: Record<Mode, typeof Mic> = { input: Keyboard, notes: NotebookPen, present: Presentation };
 const TOOL_ICON: Record<Tool, typeof Mic> = { mouse: MousePointer2, laser: Crosshair, spotlight: Sun, magnifier: Search };
@@ -50,7 +51,6 @@ const SHOWN = { opacity: 1, filter: 'blur(0px)', transitionEnd: { filter: 'none'
 const FAST_CAPTURE_MS = 34;  // ~2 frames: wait this long for the backdrop, then show the fallback
 const LATE_CAPTURE_MS = 48;  // a capture landing later may contain the (fading-in) card: discard
 const STALE_MS = 8000;       // reuse a previous backdrop on quick re-entry only while fresh
-const CARD_TOP = 12;
 /* Live capsule widths: with words, and the narrower waveform-only pill it starts as when
    no trustworthy words are coming (it springs wider when they do). */
 const LIVE_W = 364, LIVE_WHISPER_W = 404, WAVE_W = 292, WAVE_WHISPER_W = 318;
@@ -138,7 +138,6 @@ function chipWidth(copy: Pick<ChipCopy, 'title' | 'hint' | 'detail'>) {
 }
 
 export function Overlay() {
-  const [model, dispatch] = useReducer(reduce, initial);
   const [reduced, setReduced] = useState(false);
   const [noteHeight, setNoteHeight] = useState(184);
   const [glass, setGlass] = useState<Glass | null>(null);
@@ -151,24 +150,45 @@ export function Overlay() {
   const noteBody = useRef<HTMLDivElement>(null);
   const [squash, animateSquash] = useAnimate();
 
-  /* The glass canvases are laid over the whole window and shifted by the card's
-     untransformed position: centred horizontally, CARD_TOP from the top (offsetLeft
-     is unusable while an ancestor is transformed). Kept in sync while the size springs. */
+  const applyAppearance = useCallback((prefs: Snapshot['prefs']) => {
+    const root = document.documentElement;
+    const still = prefs.appearance.reduced_motion || matchMedia('(prefers-reduced-motion: reduce)').matches;
+    setReduced(still);
+    root.classList.toggle('reduced', still);
+    if (prefs.appearance.theme === 'system') delete root.dataset.theme;
+    else root.dataset.theme = prefs.appearance.theme;
+    if (isMock) {
+      const dark = prefs.appearance.theme === 'glass' || prefs.appearance.theme === 'dark' || (prefs.appearance.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+      paintPreviewDesktop(dark);
+    }
+  }, []);
+  const { model, layout, action } = useOverlayModel(applyAppearance);
+  const anchor = layout?.anchor ?? 'top-center';
+  const align = alignment(anchor);
+  const currentAnchor = useRef(anchor);
+  currentAnchor.current = anchor;
+  const syncGlass = useRef<() => void>(() => {});
+
+  // The copied desktop stays aligned while the card springs, at every anchor.
   const attachCard = useCallback((el: HTMLDivElement | null) => {
     card.current = el;
     if (!el) return;
     const sync = () => {
       const w = el.offsetWidth, h = el.offsetHeight;
-      el.style.setProperty('--bx', String((document.documentElement.clientWidth - w) / 2));
-      el.style.setProperty('--by', String(CARD_TOP));
+      const point = cardPosition(currentAnchor.current, w, h, document.documentElement.clientWidth, document.documentElement.clientHeight);
+      el.style.setProperty('--bx', String(point.x));
+      el.style.setProperty('--by', String(point.y));
       el.style.setProperty('--cw', String(w));
       el.style.setProperty('--ch', String(h));
     };
+    syncGlass.current = sync;
     sync();
     const observer = new ResizeObserver(sync);
     observer.observe(el);
-    return () => { observer.disconnect(); card.current = null; };
+    window.addEventListener('resize', sync);
+    return () => { observer.disconnect(); window.removeEventListener('resize', sync); card.current = null; syncGlass.current = () => {}; };
   }, []);
+  useLayoutEffect(() => { syncGlass.current(); }, [anchor]);
 
   // Warm the CJK fonts once at load (canvas measure + DOM text), so the very first
   // reveal never stalls on font loading.
@@ -178,76 +198,12 @@ export function Overlay() {
     return () => { (window as any).cancelIdleCallback?.(idle); clearTimeout(idle); };
   }, []);
 
-  useEffect(() => {
-    const applyPrefs = (prefs: Snapshot['prefs']) => {
-      dispatch({ type: 'config', enabled: prefs.overlay.enabled, onSwitch: prefs.overlay.on_switch, linger: prefs.overlay.linger_seconds,
-        showLocal: !!prefs.preview?.show_local_text });
-      const root = document.documentElement;
-      // The app's own switch or the system setting; `.reduced` also stills CSS loops (shimmer, rec dot).
-      const still = prefs.appearance.reduced_motion || matchMedia('(prefers-reduced-motion: reduce)').matches;
-      setReduced(still);
-      root.classList.toggle('reduced', still);
-      if (prefs.appearance.theme === 'system') delete root.dataset.theme;
-      else root.dataset.theme = prefs.appearance.theme;
-      if (isMock) {
-        const dark = prefs.appearance.theme === 'glass' || prefs.appearance.theme === 'dark' || (prefs.appearance.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
-        paintPreviewDesktop(dark);
-      }
-      if (prefs.overlay.enabled) shell.overlayShow(); else shell.overlayHide();
-    };
-    const init = (s: Snapshot) => {
-      applyPrefs(s.prefs);
-      dispatch({ type: 'init', mode: s.destination, pending: s.pending_mode, armed: s.armed, phase: s.state.phase, tool: s.tool ?? 'laser' });
-    };
-    const stop = onCore((event, data) => {
-      const at = Date.now();
-      if (event === 'level') pushLevel(data);
-      else if (event === 'ready') init(data);
-      else if (event === 'prefs') applyPrefs(data);
-      else if (event === 'mode') dispatch({ type: 'mode', value: data.value, pending: data.pending, armed: data.armed, source: data.source, tool: data.tool });
-      else if (event === 'tool') dispatch({ type: 'tool', tool: data.tool });
-      // The restarted core is idle and says nothing more: end a session card it left behind.
-      else if (event === 'core_exit') dispatch({ type: 'state', phase: 'disconnected', at });
-      else if (event === 'state') dispatch({ type: 'state', phase: data.phase, armed: data.armed, message: data.message, at, destination: data.destination, whisper: typeof data.whisper === 'boolean' ? data.whisper : undefined });
-      else if (event === 'drag') dispatch({ type: 'drag', locked: !!data.locked, how: data.how });
-      else if (event === 'empty') dispatch({ type: 'empty' });
-      else if (event === 'session_failed') dispatch({ type: 'failed', message: String(data?.message ?? '') });
-      else if (event === 'wizard_result' && !data?.error) dispatch({ type: 'test' });
-      else if (event === 'elevated') dispatch({ type: 'elevated' });
-      else if (event === 'partial') dispatch({ type: 'partial', text: String(data.text ?? ''), source: data.source });
-      else if (event === 'result') dispatch({ type: 'result', destination: data.destination, text: data.text, at: at / 1000, skipped: !!data.note_skipped,
-        empty: !!data.empty_text, noteError: !!data.note_error, local: !!data.local, external: data.external ? String(data.app || '对方软件') : undefined, notTyped: !!data.not_typed, copied: !!data.copied });
-    });
-    // The core may still be starting (it preloads the preview models): keep asking,
-    // and fall back to the shell's copy of the core's ready snapshot.
-    let tries = 0;
-    let retry = 0;
-    const load = async () => {
-      try {
-        init(await call<Snapshot>('snapshot'));
-        return;
-      } catch { /* not ready yet */ }
-      const ready = await shell.ready().catch(() => null);
-      if (ready) { init(ready); return; }
-      if (++tries < 60) retry = window.setTimeout(load, 1000);
-    };
-    load();
-    return () => { stop(); clearTimeout(retry); };
-  }, []);
-
-  useEffect(() => {
-    if (!model.timer) return;
-    const token = model.token;
-    const t = window.setTimeout(() => dispatch({ type: 'timeout', token }), model.timer.ms);
-    return () => clearTimeout(t);
-  }, [model.token, model.timer]);
-
   /* Reveal at once. If the card is fully gone, copy the backdrop first and use it
      when it lands within ~2 frames; otherwise show the frosted fallback and
      crossfade the copy in if it lands before the card is visibly there. While
      the previous card is still fading out it must not be copied: re-enter with
      the last backdrop if it is fresh. */
-  const hidden = model.view === 'hidden';
+  const hidden = model.view === 'hidden' || !layout?.active;
   useEffect(() => {
     if (hidden) {
       showing.current++;
@@ -310,13 +266,17 @@ export function Overlay() {
     return () => observer.disconnect();
   }, [model.view, revealed]);
 
-  const report = () => {
-    if (model.view === 'note' && card.current) {
+  const report = useCallback(() => {
+    if (!hidden && revealed && card.current) {
       const r = card.current.getBoundingClientRect();
       shell.overlayInteractive({ x: r.left, y: r.top, width: r.width, height: r.height });
     } else shell.overlayInteractive(null);
-  };
-  useEffect(report, [model.view, noteHeight, model.done, revealed]);
+  }, [hidden, revealed]);
+  useLayoutEffect(() => {
+    report();
+    window.addEventListener('resize', report);
+    return () => window.removeEventListener('resize', report);
+  }, [report, model.view, noteHeight, model.done, anchor, layout?.monitor]);
 
   useEffect(() => {
     if (!inTauri) return;
@@ -356,8 +316,8 @@ export function Overlay() {
 
   // Adaptive material: how bright and how busy the scene under the card is.
   const tone = useMemo<Tone | null>(() => glass
-    ? sampleTone(glass.image, { x: (innerWidth - target.w) / 2, y: CARD_TOP, w: target.w, h: target.h })
-    : null, [glass, target.w, target.h]);
+    ? sampleTone(glass.image, { ...cardPosition(anchor, target.w, target.h, innerWidth, innerHeight), w: target.w, h: target.h })
+    : null, [glass, target.w, target.h, anchor]);
 
   // Feedback on every change while visible: a soft squash on switches, a
   // gentle shake for "nothing heard"/errors, a small lift for success.
@@ -395,10 +355,12 @@ export function Overlay() {
         style={{ fontFamily: 'var(--font-display)', fontWeight: 650, fontSize: 15 }}>
         输入笔记演示已保存 <span style={{ fontFamily: 'var(--font)', fontWeight: 450, fontSize: 11.5 }}>说完插入当前编辑框 · 按住 ⑤ 使用 ③ 正在听…0:12 说完出字 · 正在识别</span>
       </div>
-      <div className="flex justify-center" style={{ paddingTop: CARD_TOP }}>
+      <div className="fixed inset-0 flex p-3" data-overlay-anchor={anchor}
+        style={{ justifyContent: align.x === 0 ? 'flex-start' : align.x === 1 ? 'flex-end' : 'center',
+          alignItems: align.y === 0 ? 'flex-start' : align.y === 1 ? 'flex-end' : 'center' }}>
         <AnimatePresence onExitComplete={refreshWhileHidden}>
           {revealed && !hidden && (
-            <motion.div key="presence" style={{ transformOrigin: '50% 0%' }}
+            <motion.div key="presence" style={{ transformOrigin: `${align.x * 100}% ${align.y * 100}%` }}
               initial={{ opacity: 0, y: -8, scale: .92 }}
               animate={{ opacity: 1, y: 0, scale: 1, transition: reduced ? QUICK : { ...SHAPE, opacity: { duration: .2, ease: [.4, 0, .6, 1] } } }}
               exit={{ opacity: 0, y: -6, scale: .9, transition: reduced ? QUICK : { duration: .26, ease: EASE, delay: .08 } }}>
@@ -406,6 +368,7 @@ export function Overlay() {
                 <motion.div ref={attachCard} role="status" aria-live="polite"
                   className={`capsule view-${model.view} mode-${mode} ${listeningNote ? 'tinted' : ''} ${glass ? 'has-backdrop' : ''}`}
                   style={materialStyle}
+                  onPointerDown={model.view !== 'note' && inTauri ? (event) => { if (event.button === 0) void getCurrentWindow().startDragging().catch(console.error); } : undefined}
                   onPointerMove={model.view === 'note' ? light : undefined}
                   initial={{ width: 64, height: 34, borderRadius: 17 }}
                   animate={{ width: target.w, height: target.h, borderRadius: target.r }}
@@ -433,7 +396,7 @@ export function Overlay() {
                       {model.view === 'live' && <LiveView model={model} reduced={reduced} />}
                       {model.view === 'note' && (
                         <NoteView model={model} bodyRef={noteBody} reduced={reduced} listening={listeningNote}
-                          onPin={() => dispatch({ type: 'pin' })} onClose={() => dispatch({ type: 'dismiss' })} />
+                          onPin={() => action('pin')} onClose={() => action('dismiss')} />
                       )}
                     </motion.div>
                   </AnimatePresence>
@@ -613,7 +576,7 @@ function LiveView({ model, reduced }: { model: Model; reduced: boolean }) {
         {model.done ? (
           <motion.div key="done" className="min-w-0 flex-1 leading-tight"
             initial={{ opacity: 0, x: 8, filter: 'blur(4px)' }} animate={{ opacity: 1, x: 0, filter: 'blur(0px)' }} transition={{ duration: .32, ease: EASE }}>
-            <div className="flex items-center gap-1.5 text-[13.5px] font-semibold">{model.external ? handedTo(model.external) : '已输入到光标处'}{model.fast && <span className="lg-tag" title="OpenLess 原文模式：本机识别后直接输入，不等云端">极速</span>}</div>
+            <div className="flex items-center gap-1.5 text-[13.5px] font-semibold">{model.external ? handedTo(model.external) : '已输入到光标处'}</div>
             <div className="lg-faint truncate text-[11.5px]">{model.external ? '文字由它直接输入到光标处' : model.text}</div>
           </motion.div>
         ) : tail.length ? (
@@ -627,10 +590,7 @@ function LiveView({ model, reduced }: { model: Model; reduced: boolean }) {
             <span className="lg-faint shrink-0 text-[11.5px]"><Elapsed since={model.startedAt} /></span>
           </motion.div>
         ) : (
-          /* Waveform only: no trustworthy words (yet). The local preview's guesses stay
-             hidden unless asked for, so the voice line carries the moment; state and time
-             sit beside the orb like a chip's title and hint. The pill is narrower and
-             springs wider if accurate live words or the result arrive. */
+          /* The voice line carries the moment until the recognizer streams words. */
           <motion.div key="wave" className="flex min-w-0 flex-1 items-center gap-3" data-wave-only
             initial={false} animate={{ ...SHOWN, transition: QUICK }} exit={{ opacity: 0, filter: 'blur(4px)', transition: { duration: .14 } }}>
             <div className="min-w-0 flex-1 leading-tight">
@@ -669,13 +629,12 @@ function NoteView({ model, bodyRef, reduced, listening, onPin, onClose }: {
   }
   const stagger = (i: number) => ({ initial: { opacity: 0, y: -5, filter: 'blur(3px)' }, animate: { opacity: 1, y: 0, filter: 'blur(0px)' }, transition: { delay: .12 + i * .04, duration: .3, ease: EASE } });
   // No words to show (yet): the voice line fills the card - while listening, and as it
-  // settles into "thinking" until the saved text arrives. Local preview words only on request.
+  // settles into "thinking" until the saved text arrives.
   const prompt = !model.done && !text;
-  const invite = listening && model.showLocal;  // words will appear as soon as they are heard
-  const caption = listening ? (model.showLocal ? '文字会边说边出现 · 再按一下结束并保存' : '说完显示文字 · 再按一下结束并保存')
+  const caption = listening ? '说完显示文字 · 再按一下结束并保存'
     : model.phase === 'processing' ? '马上显示整理好的文字' : model.phase === 'starting' ? '开头的声音已暂存' : '';
   const footer = model.savedAt ? `已保存于 ${clock(model.savedAt)}`
-    : listening ? (!text ? '只显示声线 · 结束后定稿' : isAccurate(model.source) ? '实时文字 · 结束后定稿' : '本机预览，可能不准 · 结束后定稿')
+    : listening ? (!text ? '声线随音量变化 · 结束后定稿' : '实时文字 · 结束后定稿')
       : model.phase === 'starting' ? '正在接入语音引擎' : '正在识别完整内容';
   return (
     <div ref={bodyRef} className="flex flex-col">
@@ -715,13 +674,12 @@ function NoteView({ model, bodyRef, reduced, listening, onPin, onClose }: {
               exit={{ opacity: 0, filter: 'blur(6px)', transition: { duration: .16 } }}>
               <LiveWave width={280} height={44} state={listening ? 'listening' : model.phase === 'processing' ? 'thinking' : 'idle'}
                 onColor={listening} reduced={reduced} tone={listening ? 'notes-tinted' : 'notes'} />
-              {invite && <div className="mt-1.5 text-[15px] font-semibold tracking-tight">开始说吧</div>}
-              <div className={`lg-faint text-[12px] ${invite ? 'mt-0.5' : 'mt-2'}`}>{caption}</div>
+              <div className="lg-faint mt-2 text-[12px]">{caption}</div>
             </motion.div>
           ) : (
             <motion.div key="score" className="pt-1"
               initial={{ opacity: 0, filter: 'blur(6px)' }} animate={{ opacity: 1, filter: 'blur(0px)' }} transition={{ duration: .3, ease: EASE }}>
-              <VoiceScore text={text || '…'} stage={stage} size={17} onColor={listening} reduced={reduced} />
+              <VoiceScore text={text || '…'} stage={stage} envelope={model.done ? model.envelope : null} size={17} onColor={listening} reduced={reduced} />
             </motion.div>
           )}
         </AnimatePresence>

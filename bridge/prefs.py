@@ -15,17 +15,16 @@ READ_RETRY = .25                    # another program (antivirus, backup) briefl
 VOLC_ENDPOINTS = ('bigmodel_async', 'bigmodel', 'bigmodel_nostream')
 VOLC_RESOURCE = 'volc.seedasr.sauc.duration'
 DASHSCOPE_MODEL = 'fun-asr-realtime'
+OVERLAY_ANCHORS = ('top-left', 'top-center', 'top-right', 'center-left', 'center', 'center-right',
+                   'bottom-left', 'bottom-center', 'bottom-right')
 
 DEFAULTS = {
     'version': 1,
     'mode': 'input',
     'category': 'idea',  # 0.6 leftover; notes now use tags
     'sounds': {'enabled': True, 'volume': 'medium', 'keep_awake': True},
-    'overlay': {'enabled': True, 'on_switch': True, 'linger_seconds': 5, 'position': None, 'monitor': None},
-    # Live words while speaking come from accurate sources only (OpenLess's own stream,
-    # the built-in cloud engines). The local preview model's words are often wrong: shown
-    # only when asked for. (0.10's preview.enabled is retired: skipped when read.)
-    'preview': {'show_local_text': False},
+    'overlay': {'enabled': True, 'on_switch': True, 'linger_seconds': 5, 'position': None, 'monitor': None,
+                'all_monitors': False, 'anchor': 'top-center', 'positions': {}},
     # ⑤ taps click, ③/④ long presses grab / right-click; no window after ⑤ any more
     # (0.10's airmouse.window_ms is retired: skipped when read).
     'airmouse': {'enabled': True, 'skip_slideshow': True},
@@ -34,7 +33,7 @@ DEFAULTS = {
     'appearance': {'theme': 'system', 'reduced_motion': False, 'live_shortcut': True},
     'present': {'tool': 'laser', 'hide_cursor': True, 'zoom': 200},
     # 气声: auto = lift speech that stays soft, on = every recording, off = untouched.
-    'voice': {'whisper': 'auto', 'fast_raw': False},  # 极速落字 is opt-in: local ASR is less accurate than online
+    'voice': {'whisper': 'auto'},
     # 随拿随用: the Baseus pen and Tidepool both stay ready; OpenLess runs one session at a time.
     'devices': {'coexist': True},
     # Swallow the PowerPoint shortcuts the pen also types (⑧ Ctrl+P = print) outside slideshows.
@@ -123,6 +122,18 @@ def _monitor(value):
     return value
 
 
+def _positions(value):
+    if not isinstance(value, dict) or len(value) > 32:
+        raise ValueError('最多保存 32 个显示器的位置')
+    positions = {}
+    for name, position in value.items():
+        name = _monitor(name)
+        if name is None or name in positions or position is None:
+            raise ValueError('显示器位置无效')
+        positions[name] = _position(position)
+    return positions
+
+
 def _app_id(value):
     value = _text(20)(value)
     if value and not re.fullmatch(r'\d{4,20}', value):
@@ -178,15 +189,15 @@ SCHEMA = {
     'category': _choice('idea', 'paper'),
     'sounds': {'enabled': _bool, 'volume': _choice('low', 'medium', 'high'), 'keep_awake': _bool},
     'overlay': {'enabled': _bool, 'on_switch': _bool, 'linger_seconds': _int_range(2, 30),
-                'position': _position, 'monitor': _monitor},
-    'preview': {'show_local_text': _bool},
+                'position': _position, 'monitor': _monitor, 'all_monitors': _bool,
+                'anchor': _choice(*OVERLAY_ANCHORS), 'positions': _positions},
     'airmouse': {'enabled': _bool, 'skip_slideshow': _bool},
     'hotkeys': {'toggle_mode': _accelerator, 'arm_toggle': _accelerator},
     'appearance': {'theme': _choice('system', 'light', 'dark', 'glass'), 'reduced_motion': _bool,
                    'live_shortcut': _bool},
     'present': {'tool': _choice('laser', 'spotlight', 'magnifier', 'mouse'), 'hide_cursor': _bool,
                 'zoom': _int_range(125, 400)},  # magnifier, percent
-    'voice': {'whisper': _choice('auto', 'on', 'off'), 'fast_raw': _bool},  # fast_raw: 极速落字
+    'voice': {'whisper': _choice('auto', 'on', 'off')},
     'devices': {'coexist': _bool},
     'pen': {'guard_shortcuts': _bool},
     'diagnostics': {'save_audio': _bool},
@@ -218,8 +229,8 @@ def _merge(target, patch, schema, path=''):
 
 
 def _load(target, saved, schema):
-    """Apply a saved file leaf by leaf: a retired or unknown key (0.10's
-    airmouse.window_ms, preview.enabled, 0.7's notes.pause_ms) or one invalid value is
+    """Apply a saved file leaf by leaf: a retired or unknown key (preview,
+    voice.fast_raw, airmouse.window_ms, notes.pause_ms) or one invalid value is
     skipped on its own and never takes the rest of its section with it."""
     for key, value in saved.items():
         rule = schema.get(key)

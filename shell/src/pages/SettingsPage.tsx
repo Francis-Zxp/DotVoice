@@ -11,8 +11,9 @@ import { shell } from '../lib/bridge';
 import { elevationView } from '../lib/elevation';
 import { bindingText, slotLabel } from '../lib/format';
 import { act, useStore } from '../lib/store';
-import type { Bindings, ElevationStatus, OverlayMonitor, Prefs, Tool, WhisperMode } from '../lib/types';
+import type { Bindings, ElevationStatus, OverlayAnchor, OverlayMonitor, Prefs, Tool, WhisperMode } from '../lib/types';
 import { EngineSection } from './EngineSection';
+import { ANCHORS } from '../overlay/layout';
 
 type DeviceTab = 'baseus' | 'pv60' | 'tidepool';
 type SetPrefs = (patch: Record<string, unknown>) => Promise<void>;
@@ -126,8 +127,7 @@ export function SettingsPage() {
         </Section>
         <Section id="voice" title="语音识别" hint="收音、气声与实时文字">
           <Glass className="px-6 py-1">
-            <PreviewRow prefs={prefs} setPrefs={set} />
-            <FastRawRow prefs={prefs} setPrefs={set} />
+            <SettingRow icon={<AudioLines size={17} />} title="实时文字" description="豆包和百炼支持边说边显示。OpenLess 是否显示实时文字取决于它的远程输入支持；没有实时文字时显示声线，说完后显示定稿。" />
             <WhisperRow prefs={prefs} setPrefs={set} />
             <DiagnosticsRow prefs={prefs} setPrefs={set} />
           </Glass>
@@ -185,7 +185,7 @@ export function SettingsPage() {
             </SettingRow>
             <SettingRow icon={<AppWindow size={17} />} title="关闭后留在后台" description="关闭窗口后语音输入保持当前状态；双击托盘图标返回，右键可退出。" />
             <ElevationRow prefs={prefs} />
-            <SettingRow icon={<ShieldCheck size={17} />} title="隐私" description="默认不保存录音（只有在“语音识别”里打开调试录音时，才在本机保留最近 3 段，24 小时后自动删除）。普通输入不保存文字；笔记整段保存在本机。选豆包语音或阿里云百炼时，录音会实时发给对应的云服务识别；它们的密钥用 Windows 数据保护加密，只保存在这台电脑。本机预览文字在本机离线识别，不上传。电量、时长与次数只记录数字，每支笔分别统计。" />
+            <SettingRow icon={<ShieldCheck size={17} />} title="隐私" description="默认不保存录音（只有在“语音识别”里打开调试录音时，才在本机保留最近 3 段，24 小时后自动删除）。普通输入不保存文字；笔记整段保存在本机。选豆包语音或阿里云百炼时，录音会实时发给对应的云服务识别；它们的密钥用 Windows 数据保护加密，只保存在这台电脑。电量、时长与次数只记录数字，每支笔分别统计。" />
           </Glass>
           <ProbeCard />
         </Section>
@@ -238,20 +238,6 @@ function ElevationRow({ prefs }: { prefs: Prefs }) {
       description={<>有些程序以管理员身份运行（例如部分安卓模拟器里的短剧 App），Windows 会拦截普通程序发给它们的模拟点击、滚动和文字输入：光标能动，却点不下去、打不进字。开启后点声以管理员身份运行：确认一次 UAC，登记一个登录 Windows 时在后台以管理员身份启动点声的计划任务（以后登录不再弹窗），然后自动重启。<span className="faint">代价：点声和它打开的程序拥有完整权限。关闭后删除该任务，恢复普通权限运行。</span>{view.note && <span className="block pt-1" data-elevation-note>{view.note}</span>}</>}>
       {view.restart && <button className="btn btn-sm" disabled={working} onClick={restart}>以管理员身份重启</button>}
       <Switch label="兼容管理员权限窗口" checked={view.on} disabled={!view.enabled || working} onChange={toggle} />
-    </SettingRow>
-  );
-}
-
-function FastRawRow({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
-  const on = prefs.voice?.fast_raw ?? false;
-  const openless = (prefs.engine?.kind ?? 'openless') === 'openless';
-  return (
-    <SettingRow icon={<Zap size={17} />} title="原文极速落字"
-      badge={openless ? undefined : <span className="chip" style={{ height: 20, fontSize: 11 }}>仅 OpenLess</span>}
-      description={<>默认关闭。打开后，OpenLess 选「原文」时由<b>本机 SenseVoice</b> 识别、松笔即输入，不经过 OpenLess（也不显示它的胶囊）。<span className="faint">{openless
-        ? '本机识别不如豆包 / 阿里等在线 ASR 准确，只建议在没有网络、或 OpenLess 用了整段识别很慢时临时使用；想要在线又快，请在 OpenLess 里选流式识别。'
-        : '当前语音引擎不是 OpenLess，这一项不生效；豆包、百炼本身就是在线流式识别。'}</span></>}>
-      <Switch label="原文极速落字" checked={on} onChange={(fast_raw) => setPrefs({ voice: { fast_raw } })} />
     </SettingRow>
   );
 }
@@ -487,25 +473,6 @@ function HotkeysCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
   );
 }
 
-/* The one live-text switch (0.10's "实时预览文字" merged into it). Live words from OpenLess
-   or a cloud engine always show; the local model's guesses only when this is on. With it
-   and 极速落字 both off, the local models do not run at all. */
-function PreviewRow({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
-  const available = useStore((s) => s.previewAvailable);
-  const refiner = useStore((s) => s.previewRefiner);
-  const on = !!prefs.preview?.show_local_text && available;
-  const refinerText = refiner === 'sense_voice' ? '每秒再用 SenseVoice（来自 OpenLess 的本地模型）重读当前这句。'
-    : refiner === 'paraformer' ? '每秒再用 Paraformer 重读当前这句。'
-      : '在 OpenLess 的本地识别里下载 SenseVoice small，预览会更准（重启点声生效）。';
-  return (
-    <SettingRow icon={<AudioLines size={17} />} title="显示本机预览文字（可能不准）" description={available
-      ? <>关闭时录音中只显示声线，说完出定稿；OpenLess 或云端引擎发来的实时文字照常显示。{on && <span className="faint"> {refinerText}</span>}</>
-      : '没有找到本机预览模型（models/sherpa-zh-14M）；录音中只显示声线，说完出定稿。'}>
-      <Switch label="显示本机预览文字" checked={on} disabled={!available} onChange={(v) => setPrefs({ preview: { show_local_text: v } })} />
-    </SettingRow>
-  );
-}
-
 /* The pen as a mouse, one row per gesture ("key gesture = action"). Learnable rows show
    the bound code; ③'s long press (6B) is built in. ④'s long press (6D) and the volume keys
    (78 / 79, measured 2026-10-12) have defaults; any row can be recorded again. */
@@ -663,6 +630,8 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
   const [placing, setPlacing] = useState(false);
   const [monitorError, setMonitorError] = useState('');
   const selected = prefs.overlay.monitor ?? '';
+  const scope = prefs.overlay.all_monitors ? 'all' : selected ? 'one' : 'primary';
+  const anchor = prefs.overlay.anchor ?? 'top-center';
   const name = (value: string) => value.replace(/^\\\\\.\\DISPLAY(\d+)$/i, '显示器 $1');
   const refreshMonitors = useCallback(async () => {
     setLoading(true);
@@ -675,11 +644,14 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
     finally { setLoading(false); }
   }, []);
   useEffect(() => { refreshMonitors(); }, [refreshMonitors]);
-  const missing = !!selected && !monitors.some(m => m.name === selected);
-  async function chooseMonitor(value: string) {
+  const missing = scope === 'one' && !!selected && !monitors.some(m => m.name === selected);
+  async function place(patch: Record<string, unknown>) {
     setPlacing(true);
-    try { await setPrefs({ overlay: { monitor: value || null, position: null } }); }
+    try { await setPrefs({ overlay: { ...patch, position: null, positions: {} } }); }
     finally { setPlacing(false); }
+  }
+  async function chooseScope(value: string) {
+    await place({ all_monitors: value === 'all', monitor: value === 'one' ? (selected || monitors.find(m => m.name)?.name || null) : null });
   }
   async function resetPosition() {
     setPlacing(true);
@@ -689,7 +661,7 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
   }
   return (
     <Glass className="px-6 py-1">
-      <SettingRow title="灵动胶囊" description="屏幕上方的小胶囊：切换时显示当前模式，录音时显示声线（有可靠的实时文字时一并显示），笔记模式下展开成便签。置顶但不抢输入焦点。">
+      <SettingRow title="灵动胶囊" description="桌面上的小胶囊：切换时显示当前模式，录音时显示声线（有可靠的实时文字时一并显示），笔记模式下展开成便签。置顶但不抢输入焦点。">
         <Switch label="灵动胶囊" checked={prefs.overlay.enabled} onChange={(v) => setPrefs({ overlay: { enabled: v } })} />
       </SettingRow>
       <SettingRow title="切换时显示">
@@ -699,26 +671,45 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
         <Range label="保存后停留" min={2} max={30} value={prefs.overlay.linger_seconds} className="w-[130px]" disabled={!prefs.overlay.enabled}
           onChange={(v) => setPrefs({ overlay: { linger_seconds: v } })} />
       </SettingRow>
-      <SettingRow title="位置">
+      <SettingRow title="显示屏幕">
         <div className="flex max-w-[230px] flex-col items-stretch gap-2">
-          <select className="field text-[12px]" aria-label="胶囊显示器" value={selected} disabled={loading || placing}
-            onChange={(event) => chooseMonitor(event.target.value)}>
-            <option value="">跟随主显示器（默认）</option>
+          <select className="field text-[12px]" aria-label="胶囊显示范围" value={scope} disabled={loading || placing}
+            onChange={(event) => chooseScope(event.target.value)}>
+            <option value="primary">跟随主显示器（默认）</option>
+            <option value="one" disabled={!selected && !monitors.some(m => m.name)}>指定一块屏幕</option>
+            <option value="all">所有屏幕同时显示</option>
+          </select>
+          {scope === 'one' && <select className="field text-[12px]" aria-label="胶囊显示器" value={selected} disabled={loading || placing}
+            onChange={(event) => place({ monitor: event.target.value, all_monitors: false })}>
             {missing && <option value={selected}>{name(selected)}（未连接）</option>}
             {monitors.map((m, index) => <option key={m.name ?? `unnamed-${index}`} value={m.name ?? `unnamed-${index}`} disabled={!m.name}>
               {m.name ? name(m.name) : '无名称显示器'}{m.primary ? ' · 主屏' : ''} · {m.width}×{m.height}
             </option>)}
-          </select>
-          <div className="flex items-center gap-2">
-            <button className="btn btn-sm" disabled={placing} onClick={resetPosition}>回到顶部居中</button>
-            <button className="btn btn-ghost btn-sm" disabled={loading} onClick={refreshMonitors} aria-label="刷新显示器" title="刷新显示器"><RotateCcw size={14} /></button>
+          </select>}
+          <button className="btn btn-ghost btn-sm self-end" disabled={loading} onClick={refreshMonitors} aria-label="刷新显示器">
+            <RotateCcw size={13} className={loading ? 'animate-spin' : ''} />刷新
+          </button>
+        </div>
+      </SettingRow>
+      <SettingRow title="预设位置" description={ANCHORS.find(item => item.value === anchor)?.label}>
+        <div className="flex flex-col items-end gap-2">
+          <div className="grid grid-cols-3 gap-1 rounded-xl p-1.5" role="group" aria-label="胶囊预设位置"
+            style={{ border: '1px solid var(--hair)', background: 'var(--well)' }}>
+            {ANCHORS.map(item => <button key={item.value} className="btn btn-ghost h-7 w-8 min-w-0 p-0"
+              aria-label={item.label} title={item.label} aria-pressed={anchor === item.value} disabled={placing}
+              onClick={() => place({ anchor: item.value as OverlayAnchor })}
+              style={anchor === item.value ? { background: 'var(--brand)', color: '#fff' } : { color: 'var(--faint)' }}>
+              <span className="h-1.5 w-3 rounded-full" style={{ background: 'currentColor', opacity: anchor === item.value ? 1 : .4 }} />
+            </button>)}
           </div>
+          <button className="btn btn-ghost btn-sm" disabled={placing} onClick={resetPosition}>恢复预设位置</button>
         </div>
       </SettingRow>
       <p className="faint pb-4 text-[12px]">{monitorError || (missing && !loading
-        ? '所选屏幕未连接，暂用主屏；接回后自动恢复。也可拖动便签调整位置。'
-        : monitors.some(m => !m.name) ? '无名称的屏幕无法单独记住；仍可直接拖动便签到该屏幕。'
-          : '在所选屏幕顶部居中；也可以拖动便签保留手动位置。')}</p>
+        ? '所选屏幕未连接，暂用主屏；接回后自动恢复。'
+        : scope === 'all' ? '每块屏幕同步显示；固定或收起会同步到所有胶囊。'
+          : monitors.some(m => !m.name) ? '无名称的屏幕无法单独记住；仍可在所有屏幕上显示。' : '选择胶囊所在的屏幕和位置。')}
+        {' '}可拖动胶囊调整，各屏分别记住；更换屏幕或预设位置后重新对齐。</p>
     </Glass>
   );
 }

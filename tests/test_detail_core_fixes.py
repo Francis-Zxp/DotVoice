@@ -1,7 +1,5 @@
-"""Core review fixes (2026-10-14): the fresh-install verdict survives an unfinished wizard,
-and the local preview models follow the engine (极速落字 is OpenLess only).
+"""Core review fixes: unfinished setup survives restarts and failed notes get an error cue.
 No HID, microphone, model or network is touched."""
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,13 +7,9 @@ import unittest
 from bridge import secrets
 
 try:
-    from .test_bridge import FakeBackend
     from .core_fakes import make_core
-    from .test_live_text import RecordingPreview
 except ImportError:
-    from test_bridge import FakeBackend
     from core_fakes import make_core
-    from test_live_text import RecordingPreview
 
 
 class Case(unittest.TestCase):
@@ -61,47 +55,6 @@ class NoteErrorSoundTests(Case):
         self.assertEqual(sounds[-1:], ['error'])
 
 
-class PreviewFollowsEngineTests(Case):
-    def setUp(self):
-        super().setUp()
-        self.previews, self.built = [], []
-
-    def factory(self, kind, engine):
-        backend = FakeBackend()
-        self.built.append((kind, backend))
-        return backend
-
-    def core(self):
-        core = make_core(self.base, FakeBackend(), engine_factory=self.factory,
-                         preview_factory=lambda emit: self.previews.append(RecordingPreview(emit)) or self.previews[-1])
-        self.addCleanup(core.close)
-        return core
-
-    def test_fast_raw_keeps_the_models_only_while_openless_is_the_engine(self):
-        core = self.core()
-        core.prefs_set({'voice': {'fast_raw': True}})
-        self.assertIs(core.controller.preview, self.previews[0])
-        core.prefs_set({'engine': {'kind': 'volc'}})
-        self.assertIsNone(core.controller.preview, '极速落字 does nothing for 豆包: no models')
-        self.assertEqual(self.previews[0].calls[-1], 'close')
-        core.prefs_set({'engine': {'kind': 'openless'}})
-        self.assertEqual(len(self.previews), 2, 'loaded again for OpenLess')
-        self.assertIs(core.controller.preview, self.previews[1])
-
-    def test_show_local_text_still_runs_them_for_any_engine(self):
-        core = self.core()
-        core.prefs_set({'preview': {'show_local_text': True}, 'voice': {'fast_raw': True}})
-        core.prefs_set({'engine': {'kind': 'volc'}})
-        self.assertIs(core.controller.preview, self.previews[0])
-
-    def test_a_saved_fast_raw_with_another_engine_loads_nothing_at_start(self):
-        self.runtime.mkdir(parents=True)
-        (self.runtime / 'prefs.json').write_text(json.dumps({'engine': {'kind': 'volc'}, 'voice': {'fast_raw': True}}),
-                                                 encoding='utf-8')
-        core = self.core()
-        self.assertEqual(core.engine_kind, 'volc')
-        self.assertEqual(self.previews, [])
-        self.assertIsNone(core.controller.preview)
 
 
 if __name__ == '__main__':

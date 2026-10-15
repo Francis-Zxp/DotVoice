@@ -94,15 +94,6 @@ fn apply_hotkeys(app: &AppHandle, prefs: &Value) {
     }
 }
 
-fn saved_position(prefs: &Value) -> Option<(i32, i32)> {
-    let position = prefs.get("overlay")?.get("position")?;
-    Some((position.get("x")?.as_i64()?.try_into().ok()?, position.get("y")?.as_i64()?.try_into().ok()?))
-}
-
-fn selected_monitor(prefs: &Value) -> Option<&str> {
-    prefs.get("overlay")?.get("monitor")?.as_str()
-}
-
 /// Core events that the shell itself acts on (tray, hotkeys, overlay position).
 fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
     match event {
@@ -117,13 +108,7 @@ fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
             tray::update_mode(app, data["destination"].as_str().unwrap_or("input"));
             apply_hotkeys(app, &data["prefs"]);
             appearance::apply(app, &data["prefs"]);
-            if let Some(window) = app.get_webview_window("overlay") {
-                overlay::place(&window, saved_position(&data["prefs"]), selected_monitor(&data["prefs"]));
-                // Don't depend on the page having fetched its settings in time.
-                if data["prefs"]["overlay"]["enabled"].as_bool().unwrap_or(true) {
-                    overlay::show(&window);
-                }
-            }
+            overlay::apply_prefs(app, &data["prefs"]);
         }
         "state" => {
             let phase = data["phase"].as_str().unwrap_or("disconnected");
@@ -176,7 +161,7 @@ fn on_core_event(app: &AppHandle, event: &str, data: &Value) {
             apply_hotkeys(app, data);
             appearance::apply(app, data);
             shortcut::apply_prefs(app, data);
-            overlay::update_position(app, saved_position(data), selected_monitor(data));
+            overlay::apply_prefs(app, data);
         }
         // A core that died mid-presentation can no longer release its tools.
         "core_exit" => {
@@ -210,33 +195,43 @@ fn core_restart(core: tauri::State<'_, Arc<CoreClient>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn overlay_show(app: AppHandle) {
-    if let Some(window) = app.get_webview_window("overlay") {
-        overlay::show(&window);
-    }
+fn overlay_show(window: tauri::WebviewWindow) {
+    if overlay::is_overlay(window.label()) { overlay::show(&window); }
 }
 
 #[tauri::command]
-fn overlay_hide(app: AppHandle) {
-    if let Some(window) = app.get_webview_window("overlay") {
-        overlay::hide(&window);
-    }
+fn overlay_hide(window: tauri::WebviewWindow) {
+    if overlay::is_overlay(window.label()) { overlay::hide(&window); }
 }
 
 #[tauri::command]
-fn overlay_interactive(state: tauri::State<'_, OverlayState>, rect: Option<Rect>) {
-    state.set_interactive(rect);
+fn overlay_interactive(window: tauri::WebviewWindow, rect: Option<Rect>) {
+    overlay::set_interactive(&window, rect);
 }
 
 /// Downscaled screen pixels behind the (still transparent) capsule window, for
 /// the liquid-glass material. Raw bytes: [w u32][h u32][RGBA…].
 #[tauri::command]
-fn overlay_backdrop(app: AppHandle, width: Option<u32>) -> Result<tauri::ipc::Response, String> {
-    let window = app.get_webview_window("overlay").ok_or("no overlay")?;
+fn overlay_backdrop(window: tauri::WebviewWindow, width: Option<u32>) -> Result<tauri::ipc::Response, String> {
+    if !overlay::is_overlay(window.label()) { return Err("no overlay".into()) }
     backdrop::capture(&window, width.unwrap_or(200))
         .map(tauri::ipc::Response::new)
         .ok_or_else(|| "capture failed".into())
 }
+
+#[tauri::command]
+fn overlay_layout(window: tauri::WebviewWindow) -> overlay::Layout { overlay::layout(&window) }
+
+#[tauri::command]
+fn overlay_snapshot(app: AppHandle) -> Option<overlay::PublishedModel> { overlay::snapshot(&app) }
+
+#[tauri::command]
+fn overlay_publish(window: tauri::WebviewWindow, model: Value) -> Result<overlay::PublishedModel, String> {
+    overlay::publish(&window, model)
+}
+
+#[tauri::command]
+fn overlay_action(window: tauri::WebviewWindow, action: Value) -> Result<(), String> { overlay::action(&window, action) }
 
 #[tauri::command]
 fn overlay_monitors(app: AppHandle) -> Result<Vec<overlay::MonitorInfo>, String> {
@@ -247,11 +242,10 @@ fn overlay_monitors(app: AppHandle) -> Result<Vec<overlay::MonitorInfo>, String>
 #[tauri::command]
 async fn overlay_reset_position(app: AppHandle) -> Result<(), String> {
     let core = Arc::clone(&app.state::<Arc<CoreClient>>());
-    let result = core.call("prefs_set", json!({"patch": {"overlay": {"position": null}}}), Duration::from_secs(10)).await?;
+    let result = core.call("prefs_set", json!({"patch": {"overlay": {"position": null, "positions": {}}}}), Duration::from_secs(10)).await?;
     if let Some(error) = result["error"].as_str() { return Err(error.to_string()) }
-    if let Some(window) = app.get_webview_window("overlay") {
-        overlay::place(&window, None, selected_monitor(&result));
-    }
+    overlay::apply_prefs(&app, &result);
+    overlay::reset_placement(&app);
     Ok(())
 }
 
@@ -432,6 +426,10 @@ fn main() {
             overlay_backdrop,
             overlay_reset_position,
             overlay_monitors,
+            overlay_layout,
+            overlay_snapshot,
+            overlay_publish,
+            overlay_action,
             stage_idle,
             show_main_window,
             hide_main_window,

@@ -10,9 +10,9 @@ use serde_json::{json, Map, Value};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Listener, Manager, PhysicalPosition, WebviewWindowBuilder};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, POINT, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -20,7 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetCursorPos, GetForegroundWindow, IsWindowVisible, WS_EX_NOACTIVATE,
+    FindWindowW, GetCursorPos, GetForegroundWindow, IsWindowVisible, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
     SendMessageW, PostMessageW, WM_DISPLAYCHANGE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
 };
 
@@ -303,6 +303,12 @@ fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
     check()
 }
 
+fn window_role(app: &AppHandle, hwnd: isize) -> String {
+    app.webview_windows().into_iter().find_map(|(label, window)|
+        window.hwnd().ok().filter(|h| h.0 as isize == hwnd).map(|_| label))
+        .unwrap_or_else(|| "external-window".into())
+}
+
 /// Exercise the real HWND notification/drag path without changing Windows displays.
 fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let Some(window) = app.get_webview_window("overlay") else { return };
@@ -311,7 +317,7 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let area = primary.work_area();
     let expected = PhysicalPosition::new(
         area.position.x + (area.size.width as i32 - (500.0 * primary.scale_factor()).round() as i32) / 2,
-        area.position.y + (12.0 * primary.scale_factor()).round() as i32,
+        area.position.y,
     );
     overlay::place(&window, None, None);
     let before = unsafe { GetForegroundWindow() };
@@ -341,8 +347,8 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let core = Arc::clone(&app.state::<Arc<CoreClient>>());
     let persisted = wait_until(Duration::from_secs(3), || {
         tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(2))).ok()
-            .is_some_and(|s| s["prefs"]["overlay"]["position"]["x"] == saved.x
-                && s["prefs"]["overlay"]["position"]["y"] == saved.y)
+            .is_some_and(|s| primary.name().is_some_and(|name| s["prefs"]["overlay"]["positions"][name]["x"] == saved.x
+                && s["prefs"]["overlay"]["positions"][name]["y"] == saved.y))
     });
     report.insert("longDragPositionSaved".into(), json!(persisted));
     unsafe { PostMessageW(hwnd.0 as _, WM_DISPLAYCHANGE, 32, 0); }
@@ -351,7 +357,8 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let reset = tauri::async_runtime::block_on(crate::overlay_reset_position(app.clone())).is_ok();
     let cleared = tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(3))).ok()
         .is_some_and(|s| s["prefs"]["overlay"]["position"].is_null());
-    report.insert("resetClearsSavedPosition".into(), json!(reset && cleared && window.outer_position().ok() == Some(expected)));
+    report.insert("resetClearsSavedPosition".into(), json!(reset && cleared
+        && wait_until(Duration::from_secs(3), || window.outer_position().ok() == Some(expected))));
 
     // The selected monitor travels through the real core preferences event, and reset must
     // center that monitor rather than unconditionally returning to the primary display.
@@ -363,10 +370,10 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
         let area = m.work_area();
         let centered = PhysicalPosition::new(
             area.position.x + area.size.width.saturating_sub((500.0 * m.scale_factor()).round() as u32) as i32 / 2,
-            area.position.y + (12.0 * m.scale_factor()).round() as i32,
+            area.position.y,
         );
         let changed = tauri::async_runtime::block_on(core.call("prefs_set",
-            json!({"patch": {"overlay": {"monitor": name, "position": null}}}), Duration::from_secs(3)))
+            json!({"patch": {"overlay": {"monitor": name, "position": null, "positions": {}}}}), Duration::from_secs(3)))
             .is_ok_and(|r| r.get("error").is_none());
         selected_ok &= changed && wait_until(Duration::from_secs(3), || window.outer_position().ok() == Some(centered)
             && window.outer_size().ok().is_some_and(|size| size.width == (500.0 * m.scale_factor()).round() as u32));
@@ -380,6 +387,130 @@ fn placement_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let _ = tauri::async_runtime::block_on(core.call("prefs_set",
         json!({"patch": {"overlay": {"monitor": null, "position": null}}}), Duration::from_secs(3)));
     let _ = tauri::async_runtime::block_on(crate::overlay_reset_position(app.clone()));
+}
+
+/// Real mirror HWNDs, shared state, native focus/click-through and a recreated renderer.
+/// All speech/model events below are synthetic and confined to the smoke instance.
+fn multi_monitor_checks(app: &AppHandle, report: &mut Map<String, Value>) {
+    let Some(controller) = app.get_webview_window("overlay") else { return };
+    let displays = controller.available_monitors().unwrap_or_default();
+    if displays.is_empty() { return }
+    let core = Arc::clone(&app.state::<Arc<CoreClient>>());
+    let pid = core.process_id();
+    let focus = unsafe { GetForegroundWindow() };
+    let set = |patch: Value| tauri::async_runtime::block_on(core.call("prefs_set",
+        json!({"patch":{"overlay":patch}}), Duration::from_secs(3))).is_ok_and(|r| r.get("error").is_none());
+    let windows = || app.webview_windows().into_values().filter(|w| overlay::is_overlay(w.label())).collect::<Vec<_>>();
+    let changed = set(json!({"enabled":true,"all_monitors":true,"monitor":null,"anchor":"top-center","position":null,"positions":{}}));
+    let created = changed && wait_until(Duration::from_secs(10), || windows().len() == displays.len()
+        && windows().iter().all(|w| overlay::layout(w).active && w.is_visible().unwrap_or(false)));
+    report.insert("allMonitorsCreateOneCapsuleEach".into(), json!(created));
+    report.insert("mirrorWindowsKeepFocus".into(), json!(unsafe { GetForegroundWindow() } == focus));
+    let mut anchors_ok = created;
+    for anchor in ["top-left","top-center","top-right","center-left","center","center-right","bottom-left","bottom-center","bottom-right"] {
+        anchors_ok &= set(json!({"anchor":anchor,"position":null,"positions":{}}));
+        anchors_ok &= wait_until(Duration::from_secs(4), || windows().iter().all(|window| {
+            let layout = overlay::layout(window);
+            let Some(m) = displays.iter().find(|m| m.name().map(String::as_str) == layout.monitor.as_deref()) else { return false };
+            let area = m.work_area();
+            let width = ((500.0 * m.scale_factor()).round() as u32).min(area.size.width);
+            let height = ((580.0 * m.scale_factor()).round() as u32).min(area.size.height);
+            let dx = area.size.width.saturating_sub(width) as i32;
+            let dy = area.size.height.saturating_sub(height) as i32;
+            let x = if anchor.ends_with("left") { 0 } else if anchor.ends_with("right") { dx } else { dx / 2 };
+            let y = if anchor.starts_with("bottom") { dy } else if anchor.starts_with("center") { dy / 2 } else { 0 };
+            layout.anchor == anchor && window.outer_position().ok() == Some(PhysicalPosition::new(area.position.x + x, area.position.y + y))
+                && window.outer_size().ok() == Some(tauri::PhysicalSize::new(width, height))
+        }));
+    }
+    report.insert("allMonitorsNineAnchorsRespectWorkAreasAndDpi".into(), json!(anchors_ok));
+    let mut native_ok = created;
+    let mut glass_ok = created;
+    for window in windows() {
+        native_ok &= overlay::ex_style(&window) as u32 & WS_EX_NOACTIVATE != 0;
+        overlay::set_click_through(&window, false);
+        native_ok &= overlay::ex_style(&window) as u32 & WS_EX_TRANSPARENT == 0;
+        overlay::set_click_through(&window, true);
+        native_ok &= overlay::ex_style(&window) as u32 & WS_EX_TRANSPARENT != 0;
+        glass_ok &= crate::backdrop::capture(&window, 200).is_some_and(|b| b.len() > 8);
+    }
+    report.insert("eachMirrorKeepsNoActivateAndClickThrough".into(), json!(native_ok));
+    report.insert("eachMirrorCapturesItsOwnGlassBackdrop".into(), json!(glass_ok));
+
+    let send = |event: &str, data: Value| { let _ = app.emit_to("overlay", "core://event", json!({"event":event,"data":data})); };
+    send("mode", json!({"value":"notes","pending":null,"armed":true,"source":"key","tool":"laser"}));
+    send("state", json!({"phase":"recording","armed":true,"message":""}));
+    send("result", json!({"destination":"notes","text":"多屏胶囊验证","seconds":0.2,"envelope":[0.1,0.2,0.1]}));
+    send("state", json!({"phase":"idle","armed":true,"message":""}));
+    let model_ready = wait_until(Duration::from_secs(8), || overlay::snapshot(app).is_some_and(|s|
+        s.model["text"] == "多屏胶囊验证" && s.model["view"] == "note" && s.model["phase"] == "idle"));
+    let model_summary = || overlay::snapshot(app).map(|s| json!({"seq":s.seq,"view":s.model["view"],
+        "phase":s.model["phase"],"token":s.model["token"],"session":s.model["startedAt"],
+        "pinned":s.model["pinned"],"text":s.model["text"]}));
+    report.insert("mirrorPinModelBefore".into(), json!(model_summary()));
+    let mirrors = windows();
+    let actor = mirrors.iter().find(|w| w.label() != "overlay").unwrap_or(&controller);
+    // Exercise the rendered mirror's own session/token and action handler, exactly once.
+    // A native cache can be ahead of or behind that WebView and is not a user click.
+    let button_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let capture_button = Arc::clone(&button_ready);
+    let actor_label = actor.label().to_string();
+    let pin_listener = app.listen("smoke://capsule-pin", move |event| {
+        if let Ok(data) = serde_json::from_str::<Value>(event.payload()) {
+            if data["label"] == actor_label && data["ready"] == true {
+                capture_button.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let rendered_button = model_ready && wait_until(Duration::from_secs(4), || {
+        let label = json!(actor.label()).to_string();
+        let _ = actor.eval(format!("window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{{event:'smoke://capsule-pin',payload:{{label:{label},ready:document.body.innerText.includes('多屏胶囊验证')&&!!document.querySelector('[aria-label=\"固定便签\"]')}}}})"));
+        button_ready.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    app.unlisten(pin_listener);
+    report.insert("mirrorPinButtonRendered".into(), json!(rendered_button));
+    let pinned = rendered_button && actor.eval("document.querySelector('[aria-label=\"固定便签\"]')?.click()").is_ok()
+        && wait_until(Duration::from_secs(5), || overlay::snapshot(app).is_some_and(|s| s.model["pinned"] == true));
+    report.insert("mirrorPinModelAfter".into(), json!(model_summary()));
+    report.insert("mirrorPinUpdatesTheSingleControllerModel".into(), json!(pinned));
+    report.insert("mirrorCannotPublishOrSendUnknownActions".into(), json!(actor.label() == "overlay"
+        || (overlay::publish(actor, json!({})).is_err() && overlay::action(actor, json!({"type":"shutdown"})).is_err())));
+    let single = set(json!({"all_monitors":false}))
+        && wait_until(Duration::from_secs(6), || windows().len() == 1);
+    let restored = set(json!({"all_monitors":true}))
+        && wait_until(Duration::from_secs(10), || windows().len() == displays.len());
+    report.insert("allToSingleAndBackRecreatesOnlyMirrors".into(), json!(single && restored));
+
+    // Ask the newly constructed WebViews for rendered text, not just the cached native value.
+    let rendered = Arc::new(Mutex::new(std::collections::BTreeMap::<String, bool>::new()));
+    let capture = Arc::clone(&rendered);
+    let listener = app.listen("smoke://capsule-dom", move |event| {
+        if let Ok(data) = serde_json::from_str::<Value>(event.payload()) {
+            if let Some(label) = data["label"].as_str() {
+                capture.lock().unwrap().insert(label.into(), data["ok"].as_bool().unwrap_or(false));
+            }
+        }
+    });
+    let mirrored_text = wait_until(Duration::from_secs(8), || {
+        for window in windows() {
+            let label = json!(window.label()).to_string();
+            let _ = window.eval(format!("window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{{event:'smoke://capsule-dom',payload:{{label:{label},ok:document.body.innerText.includes('多屏胶囊验证')&&!!document.querySelector('[aria-label=\"取消固定\"]')}}}})"));
+        }
+        let current = rendered.lock().unwrap();
+        current.len() == displays.len() && current.values().all(|ok| *ok)
+    });
+    app.unlisten(listener);
+    report.insert("recreatedMirrorsRenderPinnedLatestSnapshot".into(), json!(mirrored_text));
+    std::thread::sleep(Duration::from_secs(6));
+    report.insert("mirrorRecreationDoesNotRestartAnOldTimer".into(), json!(overlay::snapshot(app)
+        .is_some_and(|s| s.model["pinned"] == true && s.model["text"] == "多屏胶囊验证")));
+    report.insert("allCapsulesShareTheSameCoreProcess".into(), json!(pid.is_some() && core.process_id() == pid));
+    if let Some(s) = overlay::snapshot(app) {
+        let _ = overlay::action(&controller, json!({"type":"dismiss","session":s.model["startedAt"],"token":s.model["token"]}));
+    }
+    set(json!({"all_monitors":false,"monitor":null,"anchor":"top-center","position":null,"positions":{}}));
+    wait_until(Duration::from_secs(5), || windows().len() == 1);
+    send("state", json!({"phase":"disconnected","armed":false,"message":""}));
 }
 
 /// A controlled window behind main distinguishes real compositor transparency
@@ -410,10 +541,20 @@ fn appearance_checks(app: &AppHandle, report: &mut Map<String, Value>) {
             let _ = under.set_position(pos);
             let _ = under.set_size(size);
         }
+        let foreground_role = || window_role(app, unsafe { GetForegroundWindow() } as isize);
+        report.insert("glassFocusBeforeSetup".into(), json!(foreground_role()));
         let _ = under.show();
+        wait_until(Duration::from_secs(3), || under.is_visible().unwrap_or(false));
+        // The first show is asynchronous. Establish the controlled window's activation
+        // before asking main to take focus; each window receives just one focus request.
+        let _ = under.set_focus();
+        let activated = wait_until(Duration::from_secs(3), || foreground_role() == "smoke-underlay");
+        report.insert("glassUnderlayActivation".into(), json!(if activated { "observed" } else { "not-observed" }));
+        report.insert("glassFocusBeforeMain".into(), json!(foreground_role()));
         let _ = main.set_focus();
         std::thread::sleep(Duration::from_millis(700));
         let mut samples = Vec::new();
+        report.insert("glassFocusAtCheck".into(), json!(foreground_role()));
         report.insert("glassMainHasFocus".into(), json!(unsafe { GetForegroundWindow() } == hwnd.0 as _));
         for (name, color) in [("red", "#d66a69"), ("blue", "#668ddb")] {
             let _ = under.eval(format!("document.documentElement.style.background='{color}';document.body.style.margin='0';"));
@@ -478,6 +619,121 @@ fn appearance_checks(app: &AppHandle, report: &mut Map<String, Value>) {
     let _ = set_theme(&saved);
 }
 
+/// README images: real, normally sized windows, isolated core data and a controlled
+/// desktop behind transparent pixels. Navigation uses the app's rendered controls.
+fn documentation_shots(app: &AppHandle, report: &mut Map<String, Value>) {
+    use tauri::{LogicalSize, WebviewUrl};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(main) = app.get_webview_window("main") else { return };
+    let Some(monitor) = main.primary_monitor().ok().flatten() else { return };
+    let area = monitor.work_area();
+    let scale = monitor.scale_factor();
+    let width = 1200f64.min(area.size.width as f64 / scale - 32.);
+    let height = 800f64.min(area.size.height as f64 / scale - 32.);
+    // The application has a minimum usable size; don't capture clipped small desktops.
+    if width < 880. || height < 620. { report.insert("readmeShotsSaved".into(), json!(false)); return }
+    let Ok(under) = WebviewWindowBuilder::new(app, "smoke-readme-underlay", WebviewUrl::External("about:blank".parse().unwrap()))
+        .decorations(false).shadow(false).skip_taskbar(true).visible(false)
+        .data_directory(webview_dir()).build() else { report.insert("readmeShotsSaved".into(), json!(false)); return };
+    let _ = under.set_position(area.position); let _ = under.set_size(area.size);
+    let _ = under.eval("document.documentElement.style.background='#e8e6e1';document.body.style.margin='0'");
+    let _ = under.show(); let _ = under.set_focus();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = main.unmaximize();
+    let position = PhysicalPosition::new(area.position.x + (area.size.width as f64 - width * scale) as i32 / 2,
+        area.position.y + (area.size.height as f64 - height * scale) as i32 / 2);
+    let _ = main.set_position(position); let _ = main.set_size(LogicalSize::new(width, height));
+    let _ = main.set_position(position); let _ = main.show(); let _ = main.set_focus();
+    if let Some(window) = app.get_webview_window("overlay") { overlay::hide(&window); }
+    let core = Arc::clone(&app.state::<Arc<CoreClient>>());
+    let original = tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(5))).ok();
+    let dom = |window: &tauri::WebviewWindow, condition: &str| {
+        let seen = Arc::new(AtomicBool::new(false));
+        let received = Arc::clone(&seen);
+        let tag = condition.to_string();
+        let listener = app.listen("smoke://readme-dom", move |event| {
+            if let Ok(value) = serde_json::from_str::<Value>(event.payload()) {
+                if value["tag"] == tag && value["ok"] == true { received.store(true, Ordering::SeqCst); }
+            }
+        });
+        let tag = json!(condition).to_string();
+        let ok = wait_until(Duration::from_secs(5), || {
+            let _ = window.eval(format!("window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{{event:'smoke://readme-dom',payload:{{tag:{tag},ok:!!({condition})}}}})"));
+            seen.load(Ordering::SeqCst)
+        });
+        app.unlisten(listener); ok
+    };
+    let dir = shots_dir();
+    let _ = main.eval("[...document.querySelectorAll('[aria-label=\"主导航\"] button')].find(b=>b.textContent.includes('语音'))?.click()");
+    let mut saved = dom(&main, "!!document.querySelector('[aria-label=\"语音转写正文\"]')");
+    for theme in ["dark", "light"] {
+        let themed = tauri::async_runtime::block_on(core.call("prefs_set", json!({"patch":{"appearance":{"theme":theme}}}), Duration::from_secs(5))).is_ok();
+        saved &= themed && dom(&main, &format!("document.documentElement.dataset.theme==='{}'", theme));
+        std::thread::sleep(Duration::from_millis(500));
+        saved &= save_window_bmp(&main, &dir.join(format!("readme-home-{theme}.bmp")));
+    }
+    let _ = main.eval("[...document.querySelectorAll('[aria-label=\"主导航\"] button')].find(b=>b.textContent.includes('设置'))?.click()");
+    saved &= dom(&main, "!!document.querySelector('#set-feedback select:not(:disabled)')");
+    let _ = main.eval("(()=>{const select=document.querySelector('[aria-label=\"胶囊显示范围\"]');if(select){select.value='one';select.dispatchEvent(new Event('change',{bubbles:true}));}})()");
+    saved &= dom(&main, "!!document.querySelector('[aria-label=\"胶囊显示器\"]:not(:disabled)')");
+    let _ = main.eval("document.getElementById('set-feedback')?.scrollIntoView({behavior:'instant',block:'start'})");
+    std::thread::sleep(Duration::from_millis(600));
+    saved &= save_window_bmp(&main, &dir.join("readme-settings-feedback.bmp"));
+    // Fit the actual scope, monitor choice and nine-position control below the sticky bar.
+    let _ = main.eval("(()=>{const main=document.getElementById('main'),scope=document.querySelector('[aria-label=\"胶囊显示范围\"]'),bar=document.querySelector('.section-bar');if(main&&scope&&bar){main.scrollTop+=scope.closest('.setting-row').getBoundingClientRect().top-bar.getBoundingClientRect().bottom-20;}})()");
+    saved &= dom(&main, "(()=>{const bar=document.querySelector('.section-bar'),a=document.querySelector('[aria-label=\"胶囊显示范围\"]'),b=document.querySelector('[aria-label=\"胶囊显示器\"]'),g=document.querySelector('[aria-label=\"胶囊预设位置\"]');return bar&&a&&b&&g&&a.getBoundingClientRect().top>=bar.getBoundingClientRect().bottom&&g.getBoundingClientRect().bottom<innerHeight-20&&g.querySelectorAll('button').length===9})()");
+    std::thread::sleep(Duration::from_millis(400));
+    saved &= save_window_bmp(&main, &dir.join("readme-settings-capsule.bmp"));
+
+    if let Some(window) = app.get_webview_window("overlay") {
+        let reset = tauri::async_runtime::block_on(core.call("prefs_set", json!({"patch":{"overlay":{
+            "monitor":null,"all_monitors":false,"position":null,"positions":{},"anchor":"top-center"
+        }}}), Duration::from_secs(5))).is_ok();
+        let on_primary = reset && wait_until(Duration::from_secs(5), || {
+            let layout = overlay::layout(&window);
+            layout.anchor == "top-center" && layout.monitor.as_ref() == monitor.name()
+                && window.current_monitor().ok().flatten().is_some_and(|m| m.name() == monitor.name())
+        });
+        overlay::hide(&window);
+        let _ = main.hide(); let _ = under.set_focus();
+        // Never capture the user's desktop if the controlled background did not paint.
+        let background = on_primary && wait_until(Duration::from_secs(5), || unsafe {
+            let dc = GetDC(std::ptr::null_mut());
+            let clean = [(40, 120), (area.size.width as i32 / 2, area.size.height as i32 / 2),
+                (area.size.width as i32 - 40, area.size.height as i32 - 40)].iter().all(|(x, y)| {
+                let pixel = windows_sys::Win32::Graphics::Gdi::GetPixel(dc, area.position.x + x, area.position.y + y);
+                [0, 8, 16].iter().all(|shift| (((pixel >> shift) & 255) as i32 - ((0x00e1e6e8u32 >> shift) & 255) as i32).abs() <= 4)
+            });
+            ReleaseDC(std::ptr::null_mut(), dc); clean
+        });
+        report.insert("readmeCapsuleControlledBackdrop".into(), json!(background));
+        overlay::show(&window);
+        let send = |event: &str, data: Value| { let _ = app.emit_to("overlay", "core://event", json!({"event":event,"data":data})); };
+        send("state", json!({"phase":"disconnected","armed":false}));
+        send("mode", json!({"value":"notes","pending":null,"armed":true,"source":"key","tool":"laser"}));
+        send("state", json!({"phase":"recording","armed":true,"destination":"notes"}));
+        let text = "把零散的想法记下来。\n下一步：验证关键假设，整理成可以执行的计划。";
+        send("partial", json!({"text":text,"source":"cloud"}));
+        saved &= dom(&window, "document.body.innerText.includes('验证关键假设')&&!!document.querySelector('[aria-label=\"固定便签\"]')");
+        let _ = window.eval("document.querySelector('[aria-label=\"固定便签\"]')?.click()");
+        send("result", json!({"destination":"notes","text":text,"seconds":8.4,"envelope":[0.12,0.2,0.45,0.25,0.6,0.3,0.42,0.18]}));
+        send("state", json!({"phase":"idle","armed":true}));
+        saved &= dom(&window, "document.body.innerText.includes('验证关键假设')&&!!document.querySelector('[aria-label=\"取消固定\"]')");
+        std::thread::sleep(Duration::from_millis(2500));
+        saved &= background && save_window_bmp(&window, &dir.join("readme-capsule-note.bmp"));
+        let _ = window.eval("document.querySelector('[aria-label=\"收起\"]')?.click()");
+        send("state", json!({"phase":"disconnected","armed":false}));
+        overlay::hide(&window);
+    } else { saved = false; }
+    if let Some(original) = original {
+        let _ = tauri::async_runtime::block_on(core.call("prefs_set", json!({"patch":{"overlay":original["prefs"]["overlay"]}}), Duration::from_secs(5)));
+    }
+    report.insert("readmeWindowLogicalSize".into(), json!([width, height]));
+    report.insert("readmeWindowNotMaximized".into(), json!(!main.is_maximized().unwrap_or(true)));
+    report.insert("readmeShotsSaved".into(), json!(saved));
+    let _ = main.show(); let _ = main.set_focus(); let _ = under.close();
+}
+
 pub fn run(app: AppHandle) {
     std::thread::spawn(move || {
         if std::env::var_os(KEEP).is_none() {
@@ -494,6 +750,7 @@ pub fn run(app: AppHandle) {
         let snapshot = tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(10)));
         report.insert("coreSnapshot".into(), json!(snapshot.as_ref().map(|s| s["smoke"] == true).unwrap_or(false)));
         placement_checks(&app, &mut report);
+        multi_monitor_checks(&app, &mut report);
         let main = app.get_webview_window("main");
         report.insert("mainVisible".into(), json!(wait_until(Duration::from_secs(10), || main
             .as_ref()
@@ -513,16 +770,17 @@ pub fn run(app: AppHandle) {
             overlay::show(&window);
             std::thread::sleep(Duration::from_millis(400));
             let after = unsafe { GetForegroundWindow() } as isize;
+            report.insert("overlayFocusBefore".into(), json!(window_role(&app, before)));
+            report.insert("overlayFocusAfter".into(), json!(window_role(&app, after)));
             report.insert("overlayKeepsFocus".into(), json!(before == after));
             report.insert("overlayVisible".into(), json!(window.is_visible().unwrap_or(false)));
             // Hovering an expanded card makes the capsule clickable and back: it must stay on screen.
             overlay::set_click_through(&window, false);
             overlay::set_click_through(&window, true);
             report.insert("overlayStaysVisibleWhenInteractive".into(), json!(window.is_visible().unwrap_or(false)));
-            let state = app.state::<overlay::OverlayState>();
             report.insert(
                 "overlayClickThrough".into(),
-                json!(state.passthrough.load(std::sync::atomic::Ordering::SeqCst)),
+                json!(overlay::passthrough(&window)),
             );
             overlay::hide(&window);
             report.insert("overlayHidden".into(), json!(!window.is_visible().unwrap_or(true)));
@@ -596,6 +854,8 @@ pub fn run(app: AppHandle) {
         report.insert("magnifierShown".into(), json!(wait_until(Duration::from_secs(3), &lens)));
         magnifier.stop();
         report.insert("magnifierClosed".into(), json!(wait_until(Duration::from_secs(3), || !lens())));
+        // Documentation navigation must not change the focus preconditions of functional checks.
+        documentation_shots(&app, &mut report);
         // Smoke cores refuse to arm; a phase other than disconnected would mean a device opened.
         let phase = tauri::async_runtime::block_on(core.call("snapshot", Value::Null, Duration::from_secs(5)))
             .ok()

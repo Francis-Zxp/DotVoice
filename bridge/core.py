@@ -38,7 +38,7 @@ from .updates import UpdateWatch
 from .tidepool import TidepoolAdapter
 from .usage import UsageLedger
 
-VERSION = '0.11.5'
+VERSION = '0.11.6'
 BUSY = ('starting', 'recording', 'processing')
 MODES = ('input', 'notes', 'present')
 # Present-mode pointer tools, cycled by double-clicking the air-mouse key.
@@ -172,7 +172,7 @@ def _empty_transcript(result):
 class Core:
     def __init__(self, base, backend, emit, smoke=False, monitor_factory=None,
                  tidepool=None, sound_player=None, controller_factory=Controller,
-                 program_dir=None, preview_factory=None, device_tree=None, openless_settings=None,
+                 device_tree=None, openless_settings=None,
                  engine_factory=None, probe_factory=None, update_factory=UpdateWatch):
         """`backend` is the OpenLess engine (prefs engine.kind 'openless'); the other engines
         are built from prefs: `engine_factory(kind, engine_prefs)` and
@@ -209,7 +209,7 @@ class Core:
         self.last_codes = {}  # HID path -> last vendor code (edges per receiver)
         self.pending_mode = None
         self.live_text = ''
-        self.live_source = None  # 'local' | 'remote' | 'cloud': who wrote live_text (the UI decides what to show)
+        self.live_source = None  # 'remote' | 'cloud': the recognizer that provides the final text
         self.tool = 'laser'
         self.pointer_down = False
         self.laser_on = False
@@ -273,8 +273,6 @@ class Core:
                                              device=self.selected, mode=self.mode)
         self.controller.on_device_key = self._device_key
         self.controller.route_of = self._route_of
-        if callable(getattr(self.controller, 'typer', None)):  # 极速落字 types with it
-            self.controller.typer = self.uipi.guard_typer(self.controller.typer)
         self.controller.default_route = self._default_route
         self.controller.whisper_mode = self.prefs.get('voice', 'whisper')
         # Opt-in (prefs diagnostics.save_audio): the last recordings, raw and as sent, for
@@ -294,26 +292,8 @@ class Core:
             self.controller.set_destination('notes' if self.app_mode == 'notes' else 'input')
         except (ValueError, RuntimeError, TimeoutError, queue.Full):
             pass
-        # Local live preview (sherpa-onnx). Its words are often wrong, so the UI shows them
-        # only when asked (preview.show_local_text); its models run only while something
-        # uses them - those words, or 极速落字 (voice.fast_raw) - see _sync_preview.
-        self.preview = None
-        self.preview_lock = threading.Lock()
-        self.preview_factory = preview_factory
-        self.preview_model = self.preview_refiner = None
-        if preview_factory is None and not smoke:
-            from .preview import find_model, find_refiner, openless_models_dir
-            roots = [p for p in (program_dir, self.base) if p]
-            self.preview_model = find_model(*roots)
-            if self.preview_model:
-                self.preview_refiner = find_refiner(*roots, openless_models_dir())
-        self.preview_available = preview_factory is not None or self.preview_model is not None
-        self._sync_preview()
-        # 极速落字: OpenLess in raw mode + the local preview's text, typed at once.
         from .fast_insert import OpenLessSettings
         self.openless = openless_settings or OpenLessSettings()
-        self.controller.fast = self._fast_raw
-        self.controller.corrector = self.openless.correct
         factory = monitor_factory
         if factory is None:
             from .rawinput import RawMonitor
@@ -369,11 +349,6 @@ class Core:
                     self.tidepool.restore_presenter_pause()
                 except (OSError, ValueError, RuntimeError) as error:
                     self.log_ui_error('tidepool-restore', str(error))
-        with self.preview_lock:
-            preview, self.preview = self.preview, None
-        close = getattr(preview, 'close', None)
-        if close:
-            close()
         self.actions.shutdown(wait=False, cancel_futures=True)
         with self.lock:
             try:
@@ -949,59 +924,6 @@ class Core:
             self.laser_on = on
             self.emit('pointer', {'tool': 'laser', 'active': on, 'latched': True, 'hide_cursor': self._hide_cursor()})
 
-    def _preview_event(self, kind, value):
-        if kind == 'partial':
-            if getattr(self.controller, 'remote_live', False):
-                return  # the backend's own live text took over: a late local guess is stale
-            value = {**value, 'source': 'local'}
-            self.live_text, self.live_source = value.get('text', ''), 'local'
-            if value.get('final'):
-                self.controller.local_final(value.get('session'), value.get('text', ''))
-        elif kind == 'preview_error':
-            self.controller.local_failed()
-        self.emit(kind, value)
-
-    def _preview_wanted(self):
-        """The local models are needed for their words (shown on request) or 极速落字 (OpenLess only)."""
-        return bool(self.prefs.get('preview', 'show_local_text')
-                    or (self.prefs.get('voice', 'fast_raw') and self.engine_kind == 'openless'))
-
-    def _sync_preview(self):
-        """Run the local preview models only while something uses them: no warm-up and no
-        decoding (CPU, ~300 MB) while neither the local words nor 极速落字 is wanted.
-        Turning either on loads them ahead of the next recording."""
-        with self.preview_lock:
-            wanted = self.preview_available and self._preview_wanted() and not self.closed.is_set()
-            if wanted and self.preview is None:
-                try:
-                    if self.preview_factory is not None:
-                        self.preview = self.preview_factory(self._preview_event)
-                    else:
-                        from .preview import LivePreview
-                        self.preview = LivePreview(self.preview_model, self._preview_event,
-                                                   refiner=self.preview_refiner)
-                    warm = getattr(self.preview, 'warm', None)
-                    if warm:
-                        warm()  # the refiner is ~240 MB: load it before the first recording
-                except Exception as error:  # a broken preview never stops the core
-                    self.preview = None
-                    self.log_ui_error('preview', repr(error))
-            elif not wanted and self.preview is not None:
-                preview, self.preview = self.preview, None
-                self.controller.preview = None
-                close = getattr(preview, 'close', None)
-                if close:
-                    close()  # its worker ends and the models are freed
-            self.controller.preview = self.preview
-
-    def _fast_raw(self):
-        """极速落字 for this input session: wanted in prefs and OpenLess is in 原文 mode."""
-        if self.engine_kind != 'openless':
-            return False  # it stands in for OpenLess's raw mode; other engines have their own path
-        if self.tidepool_state.get('recording'):
-            return False  # another device is talking: OpenLess arbitrates (busy notice)
-        return bool(self.prefs.get('voice', 'fast_raw')) and self.openless.mode() == 'raw'
-
     def _apply_keep_awake(self):
         settings = self.prefs.get('sounds')
         if self.smoke or self.closed.is_set() or sound_player_is_fake(self.sounds):
@@ -1228,10 +1150,6 @@ class Core:
                     'destination': self.app_mode,
                     'pending_mode': self.pending_mode[0] if self.pending_mode else None,
                     'prefs': self.prefs.snapshot(), 'tool': self.tool,
-                    # Model files found (or a test preview): the local words can be switched on.
-                    'preview_available': self.preview_available,
-                    'preview_refiner': (getattr(self.preview, 'refiner_family', None)
-                                        or (self.preview_refiner[1] if self.preview_refiner else None)),
                     'reminder': self.upstream.state.get('reminder') if self.upstream else None,
                     'app_update': self.app_updates.snapshot() if self.app_updates else None,
                     'bindings': self.keymap.snapshot(), 'live_text': self.live_text,
@@ -1290,7 +1208,6 @@ class Core:
                 try:
                     self.prefs.save()
                 except OSError:
-                    self._sync_preview()
                     self.emit('engine', self.engine_view())
                     self.emit('prefs', data)
                     return {'error': '已应用，但设置未能保存；重启后会恢复原来的设置。'}
@@ -1304,8 +1221,6 @@ class Core:
         if engine:
             self.emit('engine', self.engine_view())
         if isinstance(patch, dict):
-            if engine or 'preview' in patch or 'voice' in patch:
-                self._sync_preview()  # the local models start or stop with show_local_text / fast_raw (OpenLess)
             if 'voice' in patch:
                 # Read when the next recording starts; the current one keeps its setting.
                 self.controller.whisper_mode = data['voice']['whisper']

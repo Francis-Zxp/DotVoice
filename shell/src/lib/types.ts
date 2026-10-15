@@ -3,9 +3,12 @@ export type Mode = 'input' | 'notes' | 'present';
 export type Tool = 'mouse' | 'laser' | 'spotlight' | 'magnifier';
 export type Category = 'idea' | 'paper';
 export type DeviceId = 'baseus' | 'pv60';
-/** Who wrote live text: the local preview model (often wrong; shown on request),
-    OpenLess's own stream, or a built-in cloud engine. See lib/liveText. */
-export type LiveSource = 'local' | 'remote' | 'cloud';
+/** Live words from OpenLess or the selected online recognizer. */
+export type LiveSource = 'remote' | 'cloud';
+
+export type OverlayAnchor = 'top-left' | 'top-center' | 'top-right' | 'center-left' | 'center' | 'center-right' | 'bottom-left' | 'bottom-center' | 'bottom-right';
+export interface OverlayLayout { anchor: OverlayAnchor; controller: boolean; active: boolean; monitor: string | null }
+export interface OverlayEnvelope<T = unknown> { seq: number; model: T }
 
 export interface CoreState {
   phase: Phase;
@@ -140,15 +143,14 @@ export interface Prefs {
   mode: Mode;
   category: Category;
   sounds: { enabled: boolean; volume: 'low' | 'medium' | 'high'; keep_awake?: boolean };
-  overlay: { enabled: boolean; on_switch: boolean; linger_seconds: number; position: { x: number; y: number } | null; monitor?: string | null };
-  /** show_local_text: show the local preview model's words while speaking (may be wrong). */
-  preview: { show_local_text: boolean };
+  overlay: { enabled: boolean; on_switch: boolean; linger_seconds: number; position: { x: number; y: number } | null; monitor?: string | null;
+    all_monitors?: boolean; anchor?: OverlayAnchor; positions?: Record<string, { x: number; y: number }> };
   airmouse: { enabled: boolean; skip_slideshow: boolean };
   hotkeys: { toggle_mode: string; arm_toggle: string };
   appearance: { theme: 'system' | 'light' | 'dark' | 'glass'; reduced_motion: boolean; live_shortcut?: boolean };
   present: { tool: Tool; hide_cursor: boolean; zoom?: number };
   /** Optional so an older core without these keys still renders (defaults shown). */
-  voice?: { whisper: WhisperMode; fast_raw?: boolean };
+  voice?: { whisper: WhisperMode };
   devices?: { coexist: boolean };
   pen?: { guard_shortcuts: boolean };
   /** save_audio: keep the last 3 recordings (raw + as sent) locally for tuning 气声; 24 h. */
@@ -314,8 +316,6 @@ export interface Snapshot {
   pending_mode: Mode | null;
   prefs: Prefs;
   tool: Tool;
-  preview_available: boolean;
-  preview_refiner?: 'sense_voice' | 'paraformer' | null;
   reminder?: Reminder | null;
   app_update?: AppUpdate | null;
   bindings: Bindings;

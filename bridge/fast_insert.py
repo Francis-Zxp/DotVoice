@@ -1,28 +1,9 @@
-"""极速落字: in OpenLess's 原文 (raw) mode, type the local SenseVoice text at the cursor.
-
-Why: OpenLess may be set to a whole-file cloud recogniser (e.g. Bailian
-fun-asr-flash) that only starts after the pen is released, so even raw text took
-5-20 s to appear. The live preview has already recognised every sentence on this
-PC by then; finishing the last one takes a fraction of a second. When OpenLess is
-in raw mode nothing else would change the words, so DotVoice types them itself.
-Polish modes still go through OpenLess (the LLM is the point there).
-
-Read-only use of OpenLess files: preferences.json (only `defaultMode`),
-correction-rules.json (its enabled literal replacements) and dictionary.json (its
-enabled phrases), so the text matches what OpenLess would have inserted. The
-local model has no hotword biasing, so dictionary phrases are restored after the
-fact: a span that sounds exactly like a phrase (same pinyin, any reading of a
-polyphone) becomes that phrase; Latin phrases get their spelling's case back.
-The same enabled phrases, most used first, are the built-in Doubao engine's hotwords
-(OpenLessSettings.hotwords). Nothing else is read; credentials live elsewhere.
-"""
+"""Shared Unicode text input and read-only OpenLess dictionary hotwords."""
 import ctypes as c
 from ctypes import wintypes as w
-from functools import lru_cache
 import json
 import os
 from pathlib import Path
-import re
 import threading
 import time
 
@@ -54,29 +35,6 @@ class _Cached:
             return self.value
 
 
-def _mode(data):
-    mode = data.get('defaultMode') if isinstance(data, dict) else None
-    return mode if isinstance(mode, str) else None
-
-
-def _rules(data):
-    rules = []
-    for rule in data if isinstance(data, list) else []:
-        if (isinstance(rule, dict) and rule.get('enabled', True) and isinstance(rule.get('pattern'), str)
-                and rule['pattern'] and isinstance(rule.get('replacement'), str)):
-            rules.append((rule['pattern'], rule['replacement']))
-    return rules
-
-
-def _phrases(data):
-    phrases = []
-    for entry in data if isinstance(data, list) else []:
-        phrase = entry.get('phrase') if isinstance(entry, dict) and entry.get('enabled', True) else None
-        if isinstance(phrase, str) and 2 <= len(phrase.strip()) <= 32:
-            phrases.append(phrase.strip())
-    return phrases
-
-
 def _hotwords(data):
     """The enabled phrases, most useful first: most used (OpenLess counts `hits`), then the
     newest (`createdAt`), then file order. A recogniser's hotword list is short."""
@@ -97,73 +55,14 @@ def _hotwords(data):
     return words
 
 
-def _cjk(ch):
-    return '\u3400' <= ch <= '\u9fff'
-
-
-@lru_cache(maxsize=4096)
-def _readings(ch):
-    """Every toneless pinyin reading of one character (empty without pypinyin)."""
-    try:
-        from pypinyin import Style, pinyin
-    except ImportError:
-        return frozenset()
-    return frozenset(pinyin(ch, style=Style.NORMAL, heteronym=True)[0])
-
-
-@lru_cache(maxsize=512)
-def _phrase_pinyin(phrase):
-    try:
-        from pypinyin import Style, lazy_pinyin
-    except ImportError:
-        return None
-    return tuple(lazy_pinyin(phrase, style=Style.NORMAL))
-
-
-def restore_phrases(text, phrases):
-    for phrase in phrases:
-        if all(_cjk(ch) for ch in phrase):
-            sound = _phrase_pinyin(phrase)
-            if not sound or len(sound) != len(phrase):
-                continue
-            out, i, n = [], 0, len(phrase)
-            while i < len(text):
-                window = text[i:i + n]
-                if (len(window) == n and window != phrase and all(_cjk(ch) for ch in window)
-                        and all(s in _readings(ch) for s, ch in zip(sound, window))):
-                    out.append(phrase)
-                    i += n
-                else:
-                    out.append(text[i])
-                    i += 1
-            text = ''.join(out)
-        elif phrase.isascii() and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .+\-]*", phrase):
-            text = re.sub(r'(?<![A-Za-z0-9])' + re.escape(phrase) + r'(?![A-Za-z0-9])', phrase, text, flags=re.IGNORECASE)
-    return text
-
-
 class OpenLessSettings:
     def __init__(self, folder=None):
         folder = Path(folder) if folder else openless_dir()
-        self._mode = _Cached(folder / 'preferences.json', _mode)
-        self._rules = _Cached(folder / 'correction-rules.json', _rules)
-        self._phrases = _Cached(folder / 'dictionary.json', _phrases)
         self._hotwords = _Cached(folder / 'dictionary.json', _hotwords)
-
-    def mode(self):
-        """'raw', 'light', 'structured', … or None when OpenLess is not installed."""
-        return self._mode.get()
 
     def hotwords(self):
         """The dictionary's enabled phrases, most useful first ([] without OpenLess)."""
         return list(self._hotwords.get())
-
-    def correct(self, text):
-        text = restore_phrases(text, self._phrases.get())
-        for pattern, replacement in self._rules.get():
-            text = text.replace(pattern, replacement)
-        return text
-
 
 # -- typing --------------------------------------------------------------------------
 INPUT_KEYBOARD = 1

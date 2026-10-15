@@ -5,6 +5,7 @@
   "windows": [
     "main",
     "overlay",
+    "overlay-mirror-*",
     "stage"
   ],
   "permissions": [

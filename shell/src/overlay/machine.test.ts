@@ -31,10 +31,10 @@ describe('capsule machine', () => {
   });
 
   it('input sessions stay compact and show the live preview, then the final text', () => {
-    let m = run([{ type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '创建一个' }]);
+    let m = run([{ type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '创建一个', source: 'remote' }]);
     expect(m.view).toBe('live');
     expect(m.text).toBe('创建一个');
-    m = run([{ type: 'result', destination: 'input', text: '创建一个函数。', at: 2 }, { type: 'partial', text: '迟到的预览' }], m);
+    m = run([{ type: 'result', destination: 'input', text: '创建一个函数。', at: 2 }, { type: 'partial', text: '迟到的预览', source: 'remote' }], m);
     expect(m.done).toBe(true);
     expect(m.final).toBe(true);
     expect(m.text).toBe('创建一个函数。');
@@ -46,8 +46,8 @@ describe('capsule machine', () => {
       mode('notes'),
       { type: 'state', phase: 'starting', at: 3 },
       { type: 'state', phase: 'recording', at: 4 },
-      { type: 'partial', text: '第一句' },
-      { type: 'partial', text: '第一句 第二句' },
+      { type: 'partial', text: '第一句', source: 'remote' },
+      { type: 'partial', text: '第一句 第二句', source: 'remote' },
     ], { ...initial, linger: 5 });
     expect(m.view).toBe('note');
     expect(m.startedAt).toBe(4);
@@ -210,7 +210,7 @@ describe('capsule machine', () => {
     let m = run([{ type: 'state', phase: 'starting', at: 1, whisper: true }, { type: 'state', phase: 'recording', at: 2 }]);
     expect(m.view).toBe('live');
     expect(m.whisper).toBe(true);
-    m = run([{ type: 'partial', text: '小声说' }, { type: 'state', phase: 'processing', at: 3 }], m);
+    m = run([{ type: 'partial', text: '小声说', source: 'remote' }, { type: 'state', phase: 'processing', at: 3 }], m);
     expect(m.whisper).toBe(true);
     m = run([{ type: 'result', destination: 'input', text: '小声说。', at: 4 }, { type: 'state', phase: 'idle', at: 5 }], m);
     expect(m.whisper).toBe(true);
@@ -287,7 +287,7 @@ describe('capsule machine', () => {
       if (r < .74) return { type: 'result', destination: pick(['input', 'notes'] as const), text: 't', at: 2, skipped: rand() < .15 };
       if (r < .8) return { type: 'empty' };
       if (r < .85) return { type: 'drag', locked: rand() < .5 };
-      if (r < .9) return { type: 'partial', text: 'p' };
+      if (r < .9) return { type: 'partial', text: 'p', source: 'remote' };
       if (r < .93) return { type: 'pin' };
       return { type: 'timeout', token: rand() < .7 ? m.token : m.token - 1 };
     };
@@ -311,57 +311,79 @@ describe('capsule machine', () => {
     }
   });
 
-  /* Live-text policy: words only from an accurate source; the local preview's guesses
-     only when asked for (preview.show_local_text). Final results always show. */
-  const config = (showLocal: boolean): Event => ({ type: 'config', enabled: true, onSwitch: true, linger: 5, showLocal });
-
-  it('local preview words stay hidden by default: a waveform-only session, then the result', () => {
+  it('retired local or missing-source previews never appear, but final results do', () => {
     let m = run([{ type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '创建一个', source: 'local' }]);
     expect(m.view).toBe('live');
-    expect(m.text).toBe('创建一个');       // kept, so the switch can still show it
-    expect(shownText(m)).toBe('');         // but not shown: waveform only
-    m = run([{ type: 'state', phase: 'processing', at: 2 }, { type: 'partial', text: '创建一个函数', source: 'local' }], m);
+    expect(m.text).toBe('');
     expect(shownText(m)).toBe('');
+    m = reduce(m, { type: 'partial', text: '没有来源' });
+    expect(m.source).toBeNull();
     m = reduce(m, { type: 'result', destination: 'input', text: '创建一个函数。', at: 3 });
     expect(shownText(m)).toBe('创建一个函数。');
   });
 
-  it('a partial without a source counts as local', () => {
-    const m = run([{ type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '旧核心的字' }]);
-    expect(m.source).toBe('local');
-    expect(shownText(m)).toBe('');
-  });
-
-  it('OpenLess and cloud words always show, also in a note', () => {
+  it('OpenLess and cloud streams appear in a note and ignore late legacy previews', () => {
     for (const source of ['remote', 'cloud']) {
       const m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '第一句', source }]);
       expect(m.view).toBe('note');
       expect(shownText(m)).toBe('第一句');
+      expect(reduce(m, { type: 'partial', text: '迟到的猜测', source: 'local' })).toBe(m);
     }
   });
 
-  it('the switch shows local words, and can be flipped mid-session', () => {
-    let m = run([config(true), { type: 'state', phase: 'recording', at: 1 }, { type: 'partial', text: '本机预览', source: 'local' }]);
-    expect(shownText(m)).toBe('本机预览');
-    m = reduce(m, config(false));
-    expect(shownText(m)).toBe('');
-    expect(m.view).toBe('live');
-    m = reduce(m, config(true));
-    expect(shownText(m)).toBe('本机预览');
+  it('the same explicit pin request from two screens cannot toggle the note back', () => {
+    const m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'pin', value: true }]);
+    expect(m.pinned).toBe(true);
+    expect(reduce(m, { type: 'pin', value: true })).toBe(m);
   });
 
-  it('once OpenLess streams, a late local guess never replaces its words', () => {
-    let m = run([config(true), { type: 'state', phase: 'recording', at: 1 },
-      { type: 'partial', text: '本机', source: 'local' }, { type: 'partial', text: '在线的字', source: 'remote' }]);
-    const before = m;
-    m = reduce(m, { type: 'partial', text: '迟到的本机字', source: 'local' });
-    expect(m).toBe(before);
-    expect(shownText(m)).toBe('在线的字');
-    // The next recording starts clean: local words are hidden again by default.
-    m = run([config(false), { type: 'result', destination: 'input', text: '在线的字。', at: 2 }, { type: 'state', phase: 'idle', at: 3 },
-      { type: 'state', phase: 'recording', at: 4 }, { type: 'partial', text: '新的本机字', source: 'local' }], m);
-    expect(m.source).toBe('local');
-    expect(shownText(m)).toBe('');
+  it('a partial arriving before the startup snapshot still restores the running note', () => {
+    const m = run([{ type: 'partial', text: '比快照更新的实时文字', source: 'cloud' }, { type: 'snapshot', at: 100,
+      snapshot: { destination: 'notes', pending_mode: null, armed: true, tool: 'laser',
+        state: { phase: 'recording', message: '' }, live_text: '旧文字', live_source: 'cloud' },
+      seen: { mode: false, state: false, tool: false, partial: true } }]);
+    expect(m).toMatchObject({ view: 'note', phase: 'recording', mode: 'notes', armed: true, startedAt: 100,
+      text: '比快照更新的实时文字', source: 'cloud' });
+  });
+
+  it('startup snapshots do not rewind newer mode, tool, phase or words', () => {
+    const m = run([mode('notes'), { type: 'tool', tool: 'mouse' }, { type: 'state', phase: 'recording', at: 100 },
+      { type: 'partial', text: '新文字', source: 'remote' }, { type: 'snapshot', at: 200,
+        snapshot: { destination: 'input', pending_mode: null, armed: false, tool: 'laser',
+          state: { phase: 'disconnected', message: '' }, live_text: '', live_source: null },
+        seen: { mode: true, state: true, tool: true, partial: true } }]);
+    expect(m).toMatchObject({ view: 'note', phase: 'recording', mode: 'notes', tool: 'mouse', armed: true,
+      startedAt: 100, text: '新文字' });
+  });
+
+  it('a processing snapshot restores a card without pretending the note is already saved', () => {
+    const m = run([{ type: 'snapshot', at: 100,
+      snapshot: { destination: 'input', pending_mode: null, armed: true, tool: 'laser',
+        state: { phase: 'processing', destination: 'notes', message: '' }, live_text: '正在整理', live_source: 'remote' },
+      seen: { mode: false, state: false, tool: false, partial: false } }]);
+    expect(m).toMatchObject({ view: 'note', phase: 'processing', done: false, savedAt: null, text: '正在整理' });
+  });
+
+  it('queued stale mirror actions cannot pin or dismiss the new recording in the same batch', () => {
+    const old = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 },
+      { type: 'result', destination: 'notes', text: '前一段', at: 2 }, { type: 'state', phase: 'idle', at: 3 }]);
+    const expected = { session: old.startedAt, token: old.token };
+    for (const action of [{ type: 'dismiss', expected }, { type: 'pin', value: true, expected }] as Event[]) {
+      const current = run([{ type: 'state', phase: 'starting', at: 4 }, { type: 'state', phase: 'recording', at: 5 }], old);
+      expect(reduce(current, action)).toBe(current);
+      expect(current).toMatchObject({ view: 'note', phase: 'recording', startedAt: 5, pinned: false });
+    }
+  });
+
+  it('a final note retains a bounded copy of its waveform for newly attached screens', () => {
+    const envelope = Array.from({ length: 900 }, (_, i) => i / 900);
+    const m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 },
+      { type: 'result', destination: 'notes', text: '记住这个想法。', at: 2, envelope }]);
+    expect(m.envelope).toEqual(envelope.slice(0, 600));
+    envelope[0] = 1;
+    expect(m.envelope?.[0]).toBe(0);
+    const next = run([{ type: 'state', phase: 'idle', at: 3 }, { type: 'state', phase: 'recording', at: 4 }], m);
+    expect(next.envelope).toBeUndefined();
   });
 
   it('a session handed to another dictation app says so, and the next one forgets it', () => {

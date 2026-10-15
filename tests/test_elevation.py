@@ -10,24 +10,19 @@ import unittest
 from unittest.mock import patch
 
 from bridge import airmouse
-from bridge.controller import NOT_TYPED_MESSAGE
 from bridge.elevation import NOTICE, NOTICE_NO_ADMIN, SETTING, ElevatedTarget, UipiWatch, kept_message
 from bridge.engines.cloud import CloudBackend
 from bridge.prefs import Preferences
 
-from bridge.controller import Controller
-
 try:
-    from .test_bridge import FakeBackend, FakeCapture, event, wait_for, PATH
+    from .test_bridge import FakeBackend, event, wait_for, PATH
     from .core_fakes import make_core
     from .test_engines import FakeASR, drain
-    from . import test_fast_insert as fast_insert_tests
     from .test_pen_keys import Alive, found
 except ImportError:
-    from test_bridge import FakeBackend, FakeCapture, event, wait_for, PATH
+    from test_bridge import FakeBackend, event, wait_for, PATH
     from core_fakes import make_core
     from test_engines import FakeASR, drain
-    import test_fast_insert as fast_insert_tests
     from test_pen_keys import Alive, found
 
 ANDROWS = (0x1A2B, 17192)   # (hwnd, pid) of the elevated emulator window
@@ -275,31 +270,6 @@ class CloudTypingTests(unittest.TestCase):
         self.assertEqual(typed, ['你好'])
 
 
-class FastTypingTests(unittest.TestCase):
-    """极速落字 into an elevated window: the local text is the result, OpenLess is not asked."""
-
-    def test_local_text_an_elevated_window_refused_is_kept_not_handed_to_openless(self):
-        backend, notifications, typed = FakeBackend(), [], []
-        control = Controller(lambda *value: notifications.append(value), backend, FakeCapture)
-        self.addCleanup(control.close)
-        control.preview = fast_insert_tests.FakePreview()
-        control.fast = lambda: True
-        control.corrector = lambda text: text.replace('U15', 'UE5')
-        control.typer = Desk().watch().guard_typer(typed.append)
-        control.command('arm')
-        wait_for(lambda: control.phase == 'idle')
-        control.on_hid(event(0x76))
-        wait_for(lambda: control.phase == 'recording')
-        control._audio(b'\x04\x00' * 800)
-        control.on_hid(event(0x77))
-        wait_for(lambda: control.phase == 'processing')
-        control.local_final(control.session_id, '打开 U15')
-        wait_for(lambda: control.phase == 'idle')
-        self.assertEqual(typed, ['打开 UE5'], 'tried once')
-        self.assertNotIn('start', backend.calls, 'OpenLess could not type there either')
-        result = [value for kind, value in notifications if kind == 'result'][-1]
-        self.assertEqual((result['text'], result['not_typed'], result['local']), ('打开 UE5', 'elevated', True))
-        self.assertEqual(control.message, NOT_TYPED_MESSAGE)
 
 
 class PrefsTests(unittest.TestCase):

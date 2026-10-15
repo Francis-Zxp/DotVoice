@@ -10,9 +10,7 @@ import uuid
 from .audio import SETTLE, AudioCapture
 from .backend import BackendBusy, OpenLessBackend
 from .devices import get_profile
-from .elevation import ElevatedTarget
 from .engines.hotkey import ExternalAppOnly
-from .fast_insert import PartlyTyped, type_text
 from .speech_meter import SpeechMeter
 from .voice_dsp import WhisperDSP
 
@@ -43,9 +41,6 @@ MIC_OFF_NOTICE = "这一下只关掉了笔上开着的麦克风（点声当时�
 # The press that switched the pen microphone on was the setup wizard's key test (step 1):
 # nothing was lost, the latch is simply still on. This press switched it off.
 TESTED_MIC_OFF_NOTICE = "这一下关掉了配置向导测试按键时打开的笔麦克风；再按一次 ⑥ 开始录音"
-# 极速落字: wait this long for the local preview to finish the last sentence before
-# handing the (kept) audio to OpenLess after all.
-FAST_WAIT = 3.0
 # Where backend live text comes from: OpenLess, or a built-in cloud engine (bridge.engines).
 PARTIAL_SOURCES = ('remote', 'cloud')
 # The hotkey bridge drives another dictation app that types into the focused field itself.
@@ -156,24 +151,8 @@ class Controller:
         self.diagnostics = None
         self.message = ''
         self.session_id = None
-        self.preview = None  # optional local live-text preview (start/feed/finish/cancel)
-        # Backend live text wins over the local preview as soon as it arrives: OpenLess's
-        # TranscriptDelta forwarded as {"type":"partial"} (older versions never send it),
-        # or a built-in cloud engine's partials through the same poll path. It comes from
-        # the recognizer that writes the final text, so the UI shows it (source 'remote' /
-        # 'cloud'); the local preview's own words are 'local' (core._preview_event).
         self.remote_text = ''
-        self.remote_live = False
         self.on_device_key = None  # (device, code, down) for non-voice PV60 keys
-        # 极速落字 (raw mode): `fast()` decides per input session (core: prefs + OpenLess
-        # in raw mode); the local preview then supplies the text and `typer` types it.
-        # The session's audio stays in memory only until then, as a fallback for OpenLess.
-        self.fast = None
-        self.typer = type_text
-        self.corrector = lambda text: text
-        self.session_fast = False
-        self.fast_pcm = []
-        self.fast_deadline = None
         # Setup wizard: test recordings (nothing typed or saved) and a volume meter while
         # no recording runs. meter_capture is opened only when the voice is paused.
         self.test_until = 0.0
@@ -462,17 +441,6 @@ class Controller:
         self._diagnose('abort')  # a debug recording not finished by now was no session
         self.dsp.reset()
         self.stop_at = self.processing_at = self.recording_at = None
-        self.session_fast = False
-        self.fast_pcm = []
-        self.fast_deadline = None
-
-    def _preview(self, method, *args):
-        # The preview is display-only; it can never fail a recording.
-        if self.preview is not None:
-            try:
-                getattr(self.preview, method)(*args)
-            except Exception:
-                pass
 
     def _diagnose(self, method, *args):
         # Debug recordings (opt-in) can never fail a recording either.
@@ -484,7 +452,6 @@ class Controller:
                 pass
 
     def _disconnect(self, cancel=True):
-        self._preview('cancel')
         self._finish_metrics('interrupted')
         self._clear_audio()
         close_error = None
@@ -640,11 +607,8 @@ class Controller:
         self.session_category = self.note_category
         self.dsp.begin(self.whisper_mode)
         self.whisper_announced = False
-        self.session_fast = False if self.session_test else self._fast_wanted()
-        self.fast_pcm, self.fast_deadline = [], None
         label = self._label()
-        self._state("starting", "正在启动本机极速落字" if self.session_fast
-                    else f"正在唤起{label}" if external
+        self._state("starting", f"正在唤起{label}" if external
                     else f"正在连接{label}，开头音频会暂存于内存" if self._cloud()
                     else "正在等待 OpenLess 确认，开头音频会暂存于内存")
         # An external app types by itself: a test with it types into the wizard's own box.
@@ -660,8 +624,7 @@ class Controller:
         if self.hardware:
             self.hardware.refresh()
         try:
-            if not self.session_fast:  # 极速落字 needs no OpenLess session (nothing to wait for)
-                self.backend.start()
+            self.backend.start()
         except BackendBusy:
             self._busy()
             if latch:
@@ -675,18 +638,16 @@ class Controller:
         if self.closing.is_set() or self.abort.is_set() or self.overflow.is_set():
             raise RuntimeError("录音启动已取消")
         self.session_id = uuid.uuid4().hex
-        self.remote_text, self.remote_live = '', False
-        self._preview('start', self.session_id)
+        self.remote_text = ''
         self._diagnose('begin', {'session': self.session_id, 'engine': self._label(), 'device': self.device,
                                  'destination': self.session_destination, 'source': self.session_source,
-                                 'whisper_mode': self.dsp.mode, 'fast': self.session_fast, 'test': self.session_test})
+                                 'whisper_mode': self.dsp.mode, 'test': self.session_test})
         for pcm in initial:
             if self.abort.is_set():
                 raise RuntimeError('录音启动已取消')
             self._feed(pcm)
         self.recording_at = time.monotonic()
-        self._state("recording", "正在录音（极速落字：松开即输入）" if self.session_fast
-                    else "正在录音；松开长按或再次短按结束")
+        self._state("recording", "正在录音；松开长按或再次短按结束")
 
     def _busy(self):
         """OpenLess said busy: another client (Tidepool, its own hotkey) is in a session.
@@ -714,14 +675,8 @@ class Controller:
             self._state('recording', self.message)  # boosting began mid-session
 
     def _send(self, pcm):
-        # OpenLess and the local preview both get the processed audio.
         self._diagnose('sent', pcm)
-        if self.session_fast:
-            self.fast_pcm.append(pcm)  # memory only, for the OpenLess fallback
-        else:
-            self.backend.feed(pcm)
-        if not self.remote_live:
-            self._preview('feed', pcm)
+        self.backend.feed(pcm)
         if self.speech_meter:
             self.notify('audio_usage', self.speech_meter.feed(pcm))
 
@@ -747,9 +702,7 @@ class Controller:
         with self.audio_lock:
             self.accept_audio = False
         self.stop_at = None
-        if not self.session_fast:
-            self.backend.cancel()
-        self._preview('cancel')
+        self.backend.cancel()
         self._finish_metrics('empty')
         self._clear_audio()
         label = self._label()
@@ -772,7 +725,6 @@ class Controller:
             self.backend.cancel()
         except Exception:
             pass
-        self._preview('cancel')
         self._finish_metrics('failed')
         self._clear_audio()
         self.session_receiver = None
@@ -860,13 +812,6 @@ class Controller:
                             self._feed(pcm)
                     elif action == "audio_error" and self.capture:
                         raise RuntimeError(data)
-                    elif action == "local_final":
-                        session, text = data
-                        if self.session_fast and self.phase == "processing" and session == self.session_id:
-                            self._fast_done(text)
-                    elif action == "local_failed":
-                        if self.session_fast and self.phase in ("recording", "processing"):
-                            self._fast_fallback()
                     elif action == "meter_error":
                         self._close_meter()
                         self.notify('meter', {'ok': False, 'message': data})
@@ -885,15 +830,8 @@ class Controller:
                                 self.accept_audio = False
                             self.stop_at = None
                             self.processing_at = now
-                            if self.session_fast:
-                                self._preview('finish')
-                                self.fast_deadline = now + FAST_WAIT
-                                self._state("processing", "正在落字")
-                            else:
-                                self.backend.stop()
-                                if not self.remote_live:
-                                    self._preview('finish')
-                                self._state("processing", self._processing_message())
+                            self.backend.stop()
+                            self._state("processing", self._processing_message())
                     limit = NOTE_LIMIT if self.session_destination == 'notes' else INPUT_LIMIT
                     if self.phase == "recording" and now - self.recording_at > limit:
                         notes = self.session_destination == 'notes'
@@ -906,8 +844,6 @@ class Controller:
                             self.stop_at = now
                             self.notify("notice", f"笔记录音已满 {limit // 60} 分钟，已自动结束并保存" if notes
                                         else CLOUD_LIMIT_NOTICE.format(minutes=int(limit // 60)))
-                    if self.session_fast and self.fast_deadline and now > self.fast_deadline:
-                        self._fast_fallback()  # the local model is too slow or stuck
                     if self.processing_at and now - self.processing_at > 120:
                         raise RuntimeError("识别超过两分钟未完成，已请求取消；不会重放音频")
                     if self.want_armed and not self.capture and now - self.last_retry >= 5:
@@ -940,72 +876,6 @@ class Controller:
             return f"{label} 正在识别（试说，不会输入）"
         return f"{label} 正在识别" + ('，完成后保存为笔记' if self.session_destination == 'notes' else '并输入文字')
 
-    # -- 极速落字 --------------------------------------------------------------
-    def _fast_wanted(self):
-        if self.session_destination != 'input' or self.preview is None or not callable(self.fast):
-            return False
-        if self._external() or self._cloud():
-            return False  # 极速落字 stands in for OpenLess's raw mode only
-        if not getattr(self.preview, 'ready', False):
-            return False  # models not loaded (yet): OpenLess as usual
-        try:
-            return bool(self.fast())
-        except Exception:
-            return False
-
-    def local_final(self, session, text):
-        """Preview thread: the local preview finished a session's text."""
-        try:
-            self.commands.put_nowait(("local_final", (session, text)))
-        except queue.Full:
-            self.overflow.set()
-
-    def local_failed(self):
-        try:
-            self.commands.put_nowait(("local_failed", None))
-        except queue.Full:
-            self.overflow.set()
-
-    def _fast_done(self, text):
-        text = (self.corrector(text or '') or '').strip()
-        if not text:
-            self._fast_fallback()  # heard speech but read nothing: let OpenLess try
-            return
-        not_typed = None
-        try:
-            self.typer(text)
-        except ElevatedTarget:
-            # An administrator window dropped the keystrokes; OpenLess could not type there
-            # either. The text is the result: kept, never retyped elsewhere.
-            not_typed = 'elevated'
-        except PartlyTyped:
-            # The start is already in the field: retyping it all would double it.
-            self.notify("notice", "部分文字没能输入（系统拦截了按键），请检查编辑框")
-        except OSError:
-            self._fast_fallback()  # Windows refused the keystrokes for another reason
-            return
-        self.fast_deadline = None
-        event = {"type": "result", "text": text, "local": True}
-        if not_typed:
-            event["not_typed"] = not_typed
-        self._backend_event(event)
-
-    def _fast_fallback(self):
-        """Local text unavailable: give OpenLess the session after all."""
-        audio, recording = self.fast_pcm, self.phase == "recording"
-        self.session_fast, self.fast_pcm, self.fast_deadline = False, [], None
-        self._preview('cancel')
-        try:
-            self.backend.start()
-        except BackendBusy:
-            self._busy()
-            return
-        for pcm in audio:
-            self.backend.feed(pcm)
-        if not recording:
-            self.backend.stop()
-            self._state("processing", "本机落字未完成，已转交 OpenLess 识别并输入文字")
-
     def _backend_event(self, event):
         if event.get("kind") == "error":
             message = event.get("message") or f"{self._label()} 识别失败"
@@ -1029,11 +899,10 @@ class Controller:
             self._clear_audio()
             # Volume history is memory-only, not PCM or word timing. It survives
             # a hidden UI and trailing pauses; usage records never store it.
-            local = bool(event.get("local"))
             value = {"text": event.get("text", ""), "seconds": elapsed,
                      "envelope": envelope, "destination": self.session_destination,
                      "category": self.session_category, "session": self.session_id,
-                     "local": local, **metrics, **whisper}
+                     **metrics, **whisper}
             app = None
             if event.get("external"):
                 # The hotkey bridge: the other app typed the words; DotVoice never saw them.
@@ -1049,7 +918,6 @@ class Controller:
                         else handed_to(app) if app
                         else "试说完成；文字没有输入到光标处" if self.session_test
                         else NOT_TYPED_MESSAGE if not_typed
-                        else "已极速落字（本机识别）" if local
                         else "本段已完成；请核对目标编辑框中的文字")
         elif event.get("type") == "partial":
             self._remote_partial(event)
@@ -1071,9 +939,6 @@ class Controller:
         # Same rule as OpenLess's TranscriptAccumulator: the delta replaces from offset.
         current = self.remote_text if offset <= len(self.remote_text) else self.remote_text.ljust(offset)
         self.remote_text = current[:offset] + text
-        if not self.remote_live:
-            self.remote_live = True
-            self._preview('cancel')
         self.notify('partial', {'session': self.session_id, 'text': self.remote_text,
                                 'final': bool(event.get('final')), 'source': self._partial_source(event)})
 

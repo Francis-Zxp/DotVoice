@@ -2,8 +2,9 @@
    stands in; it never touches devices and is clearly labelled in the UI. */
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createMock } from './mock';
-import type { ElevationStatus, OverlayMonitor } from './types';
+import type { ElevationStatus, OverlayEnvelope, OverlayLayout, OverlayMonitor } from './types';
 
 type Handler = (event: string, data: any) => void;
 
@@ -41,6 +42,14 @@ async function shellCommand<T = void>(name: string, args?: Record<string, unknow
   return invoke<T>(name, args);
 }
 
+/** Await registration before requesting a snapshot, so a newer event cannot be missed. */
+export async function onOverlay<T>(event: 'layout' | 'model' | 'action', handler: (data: T) => void): Promise<() => void> {
+  if (!inTauri) return mock.onOverlay?.(`overlay://${event}`, handler) ?? (() => {});
+  // Tauri's default Any target also receives emit_to events for other windows.
+  // Layout and mirror messages must stay scoped to the calling capsule.
+  return getCurrentWindow().listen<T>(`overlay://${event}`, (event) => handler(event.payload));
+}
+
 export const shell = {
   ready: () => shellCommand<any>('core_ready'),
   restartCore: () => shellCommand('core_restart'),
@@ -50,6 +59,10 @@ export const shell = {
     shellCommand('overlay_interactive', { rect }),
   overlayResetPosition: () => shellCommand('overlay_reset_position'),
   overlayMonitors: () => shellCommand<OverlayMonitor[]>('overlay_monitors'),
+  overlayLayout: () => shellCommand<OverlayLayout>('overlay_layout'),
+  overlayPublish: <T>(model: T) => shellCommand<OverlayEnvelope<T>>('overlay_publish', { model }),
+  overlaySnapshot: <T>() => shellCommand<OverlayEnvelope<T> | null>('overlay_snapshot'),
+  overlayAction: (action: unknown) => shellCommand('overlay_action', { action }),
   showMain: () => shellCommand('show_main_window'),
   hideMain: () => shellCommand('hide_main_window'),
   quit: () => shellCommand('quit_app'),

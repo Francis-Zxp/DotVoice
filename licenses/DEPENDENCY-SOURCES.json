@@ -7319,34 +7319,6 @@
     },
     {
       "ecosystem": "python",
-      "name": "pypinyin",
-      "version": "0.55.0",
-      "source": "https://pypi.org/project/pypinyin/0.55.0/",
-      "license": "MIT",
-      "notices": [
-        {
-          "file": "dependencies/python-pypinyin-0.55.0/LICENSE.txt",
-          "source_file": "LICENSE.txt",
-          "sha256": "1e6c90014b4912815c296ee64bb6f6280af47e6d4c5d80e86232dfc5defe764c"
-        }
-      ]
-    },
-    {
-      "ecosystem": "python",
-      "name": "sherpa-onnx",
-      "version": "1.13.8",
-      "source": "https://pypi.org/project/sherpa-onnx/1.13.8/",
-      "license": "Apache licensed, as found in the LICENSE file",
-      "notices": [
-        {
-          "file": "dependencies/python-sherpa-onnx-1.13.8/LICENSE",
-          "source_file": "LICENSE",
-          "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5"
-        }
-      ]
-    },
-    {
-      "ecosystem": "python",
       "name": "webrtcvad-wheels",
       "version": "2.0.14.post1",
       "source": "https://pypi.org/project/webrtcvad-wheels/2.0.14.post1/",

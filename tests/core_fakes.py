@@ -50,7 +50,7 @@ class FakeTidepool:
         return {'control_supported': False, 'receiver_running': False}
 
 
-def make_core(base, backend=None, controller=None, events=None, sounds=None, preview_factory=None,
+def make_core(base, backend=None, controller=None, events=None, sounds=None,
               capture=FakeCapture, device_tree=None, engine_factory=None, probe_factory=None):
     """`backend` is the OpenLess stand-in; `engine_factory(kind, engine_prefs)` builds the
     other engines (default: the real builders, which need no network to construct)."""
@@ -63,7 +63,6 @@ def make_core(base, backend=None, controller=None, events=None, sounds=None, pre
     core = Core(base, backend, lambda kind, value: events.append((kind, value)),
                 monitor_factory=FakeMonitor, tidepool=FakeTidepool(),
                 sound_player=lambda path: sounds.append(path.stem), controller_factory=factory,
-                preview_factory=preview_factory or (lambda emit: None),
                 device_tree=device_tree or FakeTree(), engine_factory=engine_factory,
                 probe_factory=probe_factory, update_factory=lambda *args: None)
     # The fake player only records the cue name. Rendering each WAV in pure Python

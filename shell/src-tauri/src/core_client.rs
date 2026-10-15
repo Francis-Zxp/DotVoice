@@ -304,6 +304,10 @@ impl CoreClient {
             .unwrap_or(false)
     }
 
+    pub fn process_id(&self) -> Option<u32> {
+        self.running.lock().unwrap().as_ref().map(|running| running.child.id())
+    }
+
     pub fn restart(self: &Arc<Self>) -> Result<(), String> {
         self.restarts.lock().unwrap().clear();
         if self.is_running() {

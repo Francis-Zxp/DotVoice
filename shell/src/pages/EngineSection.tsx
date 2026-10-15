@@ -364,7 +364,7 @@ function OpenLessPanel({ status, loading, onRefresh }: { status: OpenLessStatus 
         <ol className="engine-steps">
           <li>打开 OpenLess → 设置，开启<b>远程输入</b>；识别服务和润色风格保持不变。</li>
           <li>保持 OpenLess 运行。点声自动读取本机的配对码，不会修改 OpenLess 的任何文件。</li>
-          <li>需要极速落字（本机识别、松笔即输入）时，在下方「语音识别」里打开；只对 OpenLess 生效。</li>
+          <li>是否显示实时文字取决于 OpenLess 的远程输入支持；没有实时文字时显示声线，说完后显示定稿。</li>
         </ol>
         <p className="faint mt-2.5 flex items-start gap-1.5 text-[12px] leading-relaxed">
           <ShieldCheck size={13} className="mt-[3px] shrink-0" />

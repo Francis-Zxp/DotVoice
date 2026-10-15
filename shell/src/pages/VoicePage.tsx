@@ -40,7 +40,6 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
   const prefs = useStore((s) => s.prefs);
   const bindings = useStore((s) => s.bindings);
   const selected = useStore((s) => s.selected);
-  const previewAvailable = useStore((s) => s.previewAvailable);
   const narrow = useMedia('(max-width: 1000px)');
   const short = useMedia('(max-height: 700px)');
   const phase = state.phase;
@@ -50,10 +49,8 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
   const toggleKey = bindings?.devices?.[selected]?.toggle_mode?.label;
   // A ⑦ quick note is a note even in input / present mode.
   const look: Mode = (listening || thinking) && state.destination === 'notes' ? 'notes' : mode;
-  // Same rule as the capsule: live words only from an accurate source, the local
-  // preview's guesses only on request; otherwise the voice line alone until the result.
-  const showLocal = !!prefs?.preview?.show_local_text;
-  const live = visibleLiveText(liveText, liveSource, showLocal);
+  // Until the recognizer streams words, keep the sound visualization visible.
+  const live = visibleLiveText(liveText, liveSource);
   const waveOnly = (listening || thinking) && !live;
 
   let stage: ScoreStage = 'idle';
@@ -123,8 +120,7 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
             }}>
             <div ref={content}>
               {waveOnly ? (
-                <WaveOnly phase={phase} width={waveWidth} size={narrow ? 25 : 30} reduced={reduced} tone={look}
-                  hint={previewAvailable && !showLocal} />
+                <WaveOnly phase={phase} width={waveWidth} size={narrow ? 25 : 30} reduced={reduced} tone={look} />
               ) : (
                 <VoiceScore text={text} stage={stage} envelope={stage === 'answer' ? result?.envelope : null}
                   size={narrow ? 25 : 30} onColor={listening} reduced={reduced} dim={stage === 'idle' ? 1 : 0} />
@@ -193,11 +189,9 @@ function StatusLine({ result }: { result: Result | null }) {
   );
 }
 
-/* Listening without trustworthy words (the local preview's guesses stay hidden unless
-   asked for in settings): the capsule's voice line, large, with the state underneath.
-   It settles into "thinking" until the result's text replaces it. */
-function WaveOnly({ phase, width, size, reduced, tone, hint }: {
-  phase: Phase; width: number; size: number; reduced: boolean; tone: Mode; hint: boolean;
+/* The voice line remains visible until live words or the final result arrive. */
+function WaveOnly({ phase, width, size, reduced, tone }: {
+  phase: Phase; width: number; size: number; reduced: boolean; tone: Mode;
 }) {
   const listening = phase === 'recording';
   return (
@@ -209,7 +203,6 @@ function WaveOnly({ phase, width, size, reduced, tone, hint }: {
       </div>
       <div className="mt-2 text-[13px] leading-relaxed" style={{ opacity: .74 }}>
         {listening ? '说完显示文字' : phase === 'processing' ? '声音已收到，马上显示文字' : '开头的声音已暂存'}
-        {listening && hint && <span style={{ opacity: .8 }}> · 想边说边看，可在设置里打开本机预览文字（可能不准）</span>}
       </div>
     </div>
   );
