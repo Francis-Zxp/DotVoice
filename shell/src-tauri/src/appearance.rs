@@ -27,11 +27,12 @@ pub fn apply(app: &AppHandle, prefs: &Value) {
             // The frameless shadow has a one-pixel glass frame by default.
             // Extend it through the client area so the backdrop can show there.
             if let Ok(hwnd) = window.hwnd() {
-                let dark = i32::from(matches!(native_theme, Some(Theme::Dark)));
                 let margin = if theme == "glass" { -1 } else { 1 };
                 let margins = MARGINS { cxLeftWidth: margin, cxRightWidth: margin, cyTopHeight: margin, cyBottomHeight: margin };
-                unsafe { DwmSetWindowAttribute(hwnd.0 as _, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                    &dark as *const _ as _, 4);
+                unsafe {
+                    if let Some(dark) = immersive_dark(native_theme) {
+                        DwmSetWindowAttribute(hwnd.0 as _, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &dark as *const _ as _, 4);
+                    }
                     DwmExtendFrameIntoClientArea(hwnd.0 as _, &margins);
                 }
             }
@@ -42,4 +43,23 @@ pub fn apply(app: &AppHandle, prefs: &Value) {
         });
         if result.is_ok() { *previous = Some(theme); }
     });
+}
+
+/// The DWM dark frame for an explicit theme. "system" leaves it to tao, which follows the
+/// Windows setting (writing light here would put a light frame round a dark page).
+fn immersive_dark(native_theme: Option<Theme>) -> Option<i32> {
+    native_theme.map(|theme| i32::from(theme == Theme::Dark))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::immersive_dark;
+    use tauri::Theme;
+
+    #[test]
+    fn the_system_theme_leaves_the_dark_frame_to_windows() {
+        assert_eq!(immersive_dark(None), None);
+        assert_eq!(immersive_dark(Some(Theme::Dark)), Some(1));
+        assert_eq!(immersive_dark(Some(Theme::Light)), Some(0));
+    }
 }

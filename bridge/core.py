@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import subprocess
 import threading
 import time
 
@@ -19,7 +20,8 @@ from . import secrets
 from .airmouse import AirMouse
 from .backend import VoiceBackend
 from .battery import baseus_battery
-from .controller import BUSY_NOTICE, Controller, backend_label, report_code
+from .controller import (BUSY_NOTICE, QUICK_MIC_OFF_NOTICE, QUICK_TESTED_MIC_OFF_NOTICE,  # noqa: F401
+                         Controller, backend_label, report_code)
 from .devices import PROFILES, available_profiles
 from .diagnostics import AudioDiagnostics
 from .elevation import UipiWatch, kept_message
@@ -29,7 +31,7 @@ from .engines.cloud import (SECRET_DASHSCOPE_API_KEY, SECRET_LLM_API_KEY, SECRET
 from .fast_insert import type_text
 from .instances import InstanceRegistry
 from .keymap import ACTION_SLOTS, WHEEL_ROLES, Keymap
-from .notes import NoteStore
+from .notes import NoteStore, clean_note
 from .prefs import Preferences
 from .housekeeping import clean_runtime
 from .sounds import SOUND_VERSION, KeepAwake, Sounds
@@ -38,8 +40,9 @@ from .updates import UpdateWatch
 from .tidepool import TidepoolAdapter
 from .usage import UsageLedger
 
-VERSION = '0.11.6'
+VERSION = '0.11.8'
 BUSY = ('starting', 'recording', 'processing')
+RESTORE_QUIET = 90  # s: restoring the voice at logon, failed connects make no error cue
 MODES = ('input', 'notes', 'present')
 # Present-mode pointer tools, cycled by double-clicking the air-mouse key.
 # Double-click ⑤ cycles in this order; "mouse" draws nothing (plain air mouse).
@@ -57,8 +60,6 @@ DRAG_KEY = 0x6B    # ③ long press: 6B while held, 00 on release
 LASER_KEY = 0x64  # ② 激光键 (measured: press sends 64, no release code)
 POINTER_HOLD_MAX = 90  # s: a ⑤ hold longer than this is a lost release report
 HOLD_KEY_MAX = 90      # s: likewise for ⑧ (68 held, 69 lost): annotation pen / Ctrl
-QUICK_MIC_OFF_NOTICE = "这一下只关掉了笔上开着的麦克风（当时没在录闪念笔记，可能是开始信号丢了）；再短按一次 ⑦ 开始"
-QUICK_TESTED_MIC_OFF_NOTICE = "这一下关掉了配置向导测试按键时打开的笔麦克风；再短按一次 ⑦ 记闪念笔记"
 
 
 EMPTY_REPLY = re.compile(r'(转写|识别|输入)(的)?(内容|文本|结果)?(为空|是空的)|没有(实质|有效|可整理|任何)(的)?内容|'
@@ -163,9 +164,12 @@ def _empty_transcript(result):
     """Nothing was really said: no text, or the polisher's reply to an empty
     transcript ("转写内容为空……请提供……") after very little voiced audio."""
     text = (result.get('text') or '').strip()
-    if not text.strip('。，,.!！?？ \n'):
-        return True
+    if not text.strip('。，,.!！?？ \n') or not clean_note(text):
+        return True  # also hesitation sounds alone ("嗯。"): the note would be empty
     speech = result.get('speech_seconds')
+    if speech is not None:
+        # The VAD misses whispers (controller.py WHISPER_SPEECH); the whisper detector does not.
+        speech = max(speech, result.get('voice_seconds') or 0)
     return EMPTY_REPLY.search(text) is not None and (speech is None or speech < 1.5)
 
 
@@ -228,10 +232,12 @@ class Core:
         if settings_path.exists() and not smoke:
             try:
                 settings = json.loads(settings_path.read_text(encoding='utf-8'))
-                if settings.get('device') in PROFILES:
-                    self.selected = settings['device']
-                if settings.get('mode') in ('hold', 'toggle'):
-                    self.mode = settings['mode']
+                if isinstance(settings, dict):  # null / [] / {"device": []}: keep the defaults
+                    device, mode = settings.get('device'), settings.get('mode')
+                    if isinstance(device, str) and device in PROFILES:
+                        self.selected = device
+                    if mode in ('hold', 'toggle'):
+                        self.mode = mode
             except (OSError, ValueError):
                 pass
         usage_name = 'smoke-usage.json' if smoke else ('usage-pv60.json' if self.selected == 'pv60' else 'usage.json')
@@ -253,6 +259,11 @@ class Core:
         self.tidepool_state = {'installed': False, 'receiver_running': None,
                                'control_supported': False, 'device_online': None,
                                'message': '正在检查本机 Tidepool 接收器…'}
+        self.tidepool_polled = threading.Event()  # the first status above has been read
+        # _restore_arm at logon: OpenLess may still be starting, so the first failed connects
+        # stay quiet until this monotonic time (or the first 'idle'); the retries go on as usual.
+        self.restore_quiet_until = 0.0
+        self.log_lock = threading.Lock()  # ui-errors.log: RPC workers, ticker and key actions
         self.device_options = [{**v, 'present': False} for v in PROFILES.values()]
         self.airmouse = AirMouse(lambda: self.prefs.get('airmouse'),
                                  lambda: self.keymap.airmouse_vks(self.selected))
@@ -328,6 +339,9 @@ class Core:
             threading.Thread(target=self._poll_tidepool, name='tidepool-poll', daemon=True).start()
         threading.Thread(target=self._ticker, name='core-ticker', daemon=True).start()
         self._apply_airmouse()
+        if not self.smoke and self.prefs.get('general', 'restore_armed') and self.prefs.get('voice', 'armed'):
+            # Like the arm key: off this thread, as an exclusive arm may wait for Tidepool.
+            threading.Thread(target=self._restore_arm, name='restore-arm', daemon=True).start()
 
     def close(self):
         if self.closed.is_set():
@@ -387,6 +401,12 @@ class Core:
             # the stop cue says this press arrived, the notice says to press once more.
             self.emit('notice', value)
             self.sounds.play('stop')
+            return
+        if kind == 'empty':
+            # No speech, nothing sent: the same cue as the other empty outcomes, so a hold-mode
+            # release is heard.
+            self.emit(kind, value)
+            self.sounds.play('disarmed')
             return
         if kind not in self.STATEFUL:
             if kind == 'partial':
@@ -496,8 +516,8 @@ class Core:
         return {key: info.get(key) for key in ('kind', 'process', 'first', 'message')}
 
     def _keep_text(self, value):
-        """An administrator window dropped the typed text: put it on the clipboard (Ctrl+V
-        works there, the keyboard is real) and say so with the result; it is never lost."""
+        """Typed text did not reach the window (administrator window, lock screen, UAC prompt):
+        put it on the clipboard and say so with the result; it is never lost."""
         text = (value.get('text') or '').strip()
         copied = False
         if text and not self.smoke:
@@ -507,7 +527,8 @@ class Core:
             except (ValueError, OSError):
                 pass
         can_elevate = bool(self.uipi.own().get('can_elevate'))
-        return {**value, 'copied': copied, 'not_typed_message': kept_message(copied, can_elevate)}
+        return {**value, 'copied': copied,
+                'not_typed_message': kept_message(copied, can_elevate, value.get('not_typed'))}
 
     # -- receivers (several identical pens) ---------------------------------------
     def _emit_instances(self):
@@ -562,8 +583,10 @@ class Core:
             return 'start_notes' if notes else 'start_input'  # OpenLess confirmed the session
         if previous == 'recording' and phase == 'processing':
             return 'stop'
+        if phase == 'idle':
+            self.restore_quiet_until = 0.0  # connected: later errors are heard again
         if phase == 'error' and previous != 'error':
-            return 'error'
+            return None if time.monotonic() < self.restore_quiet_until else 'error'
         if previous in ('disconnected', 'error') and phase == 'idle':
             return 'armed'
         if phase == 'disconnected' and previous != 'disconnected' and not self.controller.want_armed:
@@ -740,10 +763,34 @@ class Core:
         elif slot == 'cancel':
             self.action('cancel')
 
-    def _key_arm(self):
-        answer = self.action('arm')
+    def _key_arm(self, remember=True):
+        """remember=False: not the user's own arm (an engine swap, restoring the last state)."""
+        answer = self.action('arm') if remember else self._action('arm')
         if answer.get('error') and not self.closed.is_set():
             self.emit('notice', answer['error'])
+
+    def _restore_arm(self):
+        """Core.start: the voice was on when DotVoice last stopped (logon, reboot, update), so it
+        comes back on the way the arm key does it. The controller keeps retrying while the
+        receiver or the engine is not there yet."""
+        self.restore_quiet_until = time.monotonic() + RESTORE_QUIET
+        if not self._coexist():
+            # Exclusive: the arm pauses Tidepool first, which needs its first status.
+            self.tidepool_polled.wait(20)
+        if not self.closed.is_set():
+            self._key_arm(remember=False)
+
+    def _remember_armed(self, armed):
+        """The user's own 启用 / 暂停 (UI, tray, keys, hotkey, wizard), kept in prefs voice.armed
+        for general.restore_armed. Errors, unplugging and engine swaps never come here."""
+        try:
+            if self.smoke or self.prefs.get('voice', 'armed') == armed:
+                return
+            data = self.prefs.update({'voice': {'armed': armed}}, persist=False)
+        except (KeyError, TypeError, ValueError):  # like _coexist: never fails the arm itself
+            return
+        self._save_prefs()
+        self.emit('prefs', data)
 
     def _quick_note(self, code=None, receiver=None):
         """⑦ short press: 7a turns the pen microphone on (start a note in any mode),
@@ -753,15 +800,13 @@ class Core:
         if code == 0x7a:
             action = 'latch_note'  # 7a latches the pen microphone on (remembered if refused)
         elif code == 0x7b:
-            action = 'stop_note'
-            hint = control.latch_hint(receiver) if hasattr(control, 'latch_hint') else 'lost'
-            if control.phase == 'idle':
-                # Same firmware latch as ⑥: the 7a that switched the microphone on was lost
-                # (or that note already ended another way). Never record: the microphone is off.
-                # No hint after a 7a that was refused (it said why) or was the wizard's key test.
-                if hint:
-                    self.notify('mic_off', QUICK_TESTED_MIC_OFF_NOTICE if hint == 'tested' else QUICK_MIC_OFF_NOTICE)
-                return
+            # Same firmware latch as ⑥: decided on the controller thread, after any 7a still
+            # queued or running there (like ⑥'s 75), so a note that starts late is still ended.
+            # Idle then means the 7a was lost: never record, the microphone is off; no hint after
+            # a 7a that was refused (it said why) or was the wizard's key test.
+            control.command('stop_note', receiver=receiver)
+            control.command('quick_off', receiver=receiver)
+            return
         else:
             quick = control.session_source == 'quick' and control.phase in ('starting', 'recording')
             action = 'stop_note' if quick else 'start_note'
@@ -945,7 +990,16 @@ class Core:
         if (not isinstance(url, str) or not (url.startswith('https://github.com/') or url in HELP_URLS)
                 or self.smoke):
             return {'error': '只能打开 GitHub 或获取密钥的帮助页面'}
-        os.startfile(url)
+        try:
+            if self.uipi.own().get('elevated'):
+                # Running as administrator: explorer.exe hands the link to the normal desktop
+                # shell, so the browser (and the update it downloads) never starts elevated.
+                explorer = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'explorer.exe'
+                subprocess.Popen([str(explorer), url], creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                os.startfile(url)
+        except OSError as error:
+            return {'error': f'无法打开链接：{error}'}
         return {'ok': True}
 
     def dismiss_reminder(self):
@@ -1048,8 +1102,10 @@ class Core:
                 remap = guard = False
                 self.guard.enabled = self.airmouse.remap_enabled = False
             try:
-                # Other keyboards' modifiers tell the guard a real Ctrl+P apart from the pen's.
-                self.monitor.on_foreign_key = (lambda vk, down: self.guard.raw_key(vk, down, pen=False)) if guard else None
+                # Other keyboards' modifiers tell the guard (and typed_by_pen's ③ F5 check) a real
+                # Shift/Ctrl apart from the pen's.
+                self.monitor.on_foreign_key = ((lambda vk, down: self.guard.raw_key(vk, down, pen=False))
+                                               if (remap or guard) else None)
             except AttributeError:
                 pass
             try:
@@ -1138,6 +1194,10 @@ class Core:
             data['battery'] = {**battery, 'percent': shown, 'raw': battery['percent']}
         data['battery_samples'] = samples[-48:]
         data['reduced_motion'] = self.prefs.get('appearance', 'reduced_motion')
+        # The 续航 page shows these: usage.json and instances.json (device names) recovery or
+        # write failures, which would otherwise only be in the files' own state.
+        # Each text is a full sentence (ends with 。), joined like the key bindings' notices.
+        data['warning'] = ' '.join(w for w in (data.get('warning'), self.instances.warning) if w)
         return data
 
     def snapshot(self):
@@ -1292,8 +1352,11 @@ class Core:
                 if not self.closed.is_set():
                     # The pause was already asked for: the voice was on, so it comes back on
                     # with the engine it had (the arm waits for that pause if it still ends).
-                    threading.Thread(target=self._key_arm, name='engine-arm', daemon=True).start()
-                return {'error': f'{error}（语音引擎没有更换，已恢复原来的语音输入）'}
+                    # Its state events report whether that worked.
+                    threading.Thread(target=self._key_arm, kwargs={'remember': False},
+                                     name='engine-arm', daemon=True).start()
+                    return {'error': f'{error}（语音引擎没有更换，正在恢复原来的语音输入）'}
+                return {'error': f'{error}（语音引擎没有更换）'}
         old, control.backend = control.backend, backend
         self.engine_kind = kind
         if old is not backend:
@@ -1303,7 +1366,8 @@ class Core:
                 pass
         if was_armed and not self.closed.is_set():
             # As with the pen's arm key: an exclusive arm may wait for Tidepool to pause.
-            threading.Thread(target=self._key_arm, name='engine-arm', daemon=True).start()
+            threading.Thread(target=self._key_arm, kwargs={'remember': False},
+                             name='engine-arm', daemon=True).start()
         return None
 
     def engine_view(self):
@@ -1369,7 +1433,7 @@ class Core:
         except ValueError as error:
             return {'error': str(error)}
         except OSError:
-            return {'error': '密钥未能加密保存（Windows 数据保护不可用）'}
+            return {'error': '密钥未能保存（Windows 数据保护不可用，或 secrets.json 被其它程序占用），请重试'}
         return self._secrets_changed(name)
 
     def secret_delete(self, name=''):
@@ -1528,9 +1592,15 @@ class Core:
         line = '%s [%s] %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), str(where)[:20],
                                   str(detail)[:1200].replace('\n', ' | '))
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            old = path.read_text(encoding='utf-8')[-20000:] if path.exists() else ''
-            path.write_text(old + line, encoding='utf-8')
+            # One writer at a time (RPC workers of every window, the ticker, key actions): two
+            # overlapping rewrites used to leave half a character and break every later call.
+            # errors='replace' also heals such a file and takes a lone surrogate from a page.
+            with self.log_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                old = path.read_text(encoding='utf-8', errors='replace')[-20000:] if path.exists() else ''
+                temp = path.with_suffix('.tmp')
+                temp.write_text(old + line, encoding='utf-8', errors='replace')
+                temp.replace(path)
         except OSError:
             pass
         return {'ok': True}
@@ -1626,7 +1696,9 @@ class Core:
                 if device not in PROFILES:
                     raise ValueError('不支持的翻页笔')
                 filename = 'usage.json' if device == 'baseus' else 'usage-pv60.json'
-                ledger = UsageLedger(self.runtime / filename)
+                current = 'usage.json' if self.selected == 'baseus' else 'usage-pv60.json'
+                # Same file (a hold/toggle change): keep the ledger, a fresh copy would lose unsaved usage.
+                ledger = self.ledger if filename == current else UsageLedger(self.runtime / filename)
                 self.controller.select_device(device, mode)
                 try:
                     self.ledger.tick('disconnected')
@@ -1649,6 +1721,14 @@ class Core:
         return self.snapshot()
 
     def action(self, action):
+        """RPC (UI, tray, wizard), the arm key and the hotkey: the user's own 启用 / 暂停 is
+        also remembered for the next start (prefs voice.armed)."""
+        answer = self._action(action)
+        if action in ('arm', 'disarm') and not answer.get('error'):
+            self._remember_armed(action == 'arm')
+        return answer
+
+    def _action(self, action):
         if self.closed.is_set():
             return {'error': '点声正在退出'}
         if self.smoke:
@@ -1741,6 +1821,7 @@ class Core:
                 self.emit('tidepool', status)
             except Exception:  # an unexpected reply must not end polling for good
                 pass
+            self.tidepool_polled.set()
             supported = self.tidepool_state.get('control_supported')
             # The legacy probe starts PowerShell; back off hard while hidden.
             interval = 3 if self.visible and supported else 20 if (supported or self.visible) else 120
@@ -1768,7 +1849,7 @@ class Core:
         """Once a second. Each step is guarded on its own: one failure (a full disk, an
         odd reply) must never stop usage, status, the key-log flush, the learn timeout
         or the forgotten drag-lock release for good."""
-        due = {'usage': 0, 'status': 0, 'audio': time.monotonic() + 600,
+        due = {'usage': 0, 'status': 0, 'audio': time.monotonic() + self._keep_awake_retry(),
                'upstream': time.monotonic() + 90, 'app_update': time.monotonic() + 5,
                'diagnostics': time.monotonic() + 3600}
         logged = set()
@@ -1782,7 +1863,10 @@ class Core:
                 except Exception as error:
                     if (name, repr(error)) not in logged and len(logged) < 50:
                         logged.add((name, repr(error)))  # each distinct failure once
-                        self.log_ui_error('core-' + name, repr(error))
+                        try:
+                            self.log_ui_error('core-' + name, repr(error))
+                        except Exception:
+                            pass  # logging can never end the ticker
 
     def _tick_upstream(self, due):
         if self.upstream and time.monotonic() >= due['upstream']:
@@ -1801,6 +1885,14 @@ class Core:
         if time.monotonic() >= due['audio']:
             due['audio'] = time.monotonic() + 600
             self.keep_awake.refresh()  # follow a changed default output device
+            due['audio'] = time.monotonic() + self._keep_awake_retry()
+
+    def _keep_awake_retry(self):
+        """Seconds to the next keep-awake refresh: a stream that is wanted but failed to open
+        (no output device yet at logon, a Bluetooth speaker still connecting) is retried after
+        a minute; a running one follows a changed default device every 10 minutes."""
+        awake = self.keep_awake
+        return 60 if awake.wanted and not awake.running else 600
 
     def _tick_diagnostics(self, due):
         """Hourly: debug recordings never outlive their 24 hours, even with no new recording."""

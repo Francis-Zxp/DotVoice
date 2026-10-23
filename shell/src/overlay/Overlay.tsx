@@ -28,7 +28,7 @@ import { levels, MODE_INFO, TOOL_INFO } from '../lib/store';
 import type { Mode, Snapshot, Tool } from '../lib/types';
 import { captureBackdrop, paintPreviewDesktop, sampleTone, type Tone } from './backdrop';
 import { LiveWave } from './LiveWave';
-import { shownText, type Model } from './machine';
+import { isBusy, shownText, type Model } from './machine';
 import { alignment, cardPosition } from './layout';
 import { useOverlayModel } from './useOverlayModel';
 
@@ -101,7 +101,8 @@ function chipText(model: Model): Omit<ChipCopy, 'fill'> {
     return { icon: <FlaskConical size={18} strokeWidth={2.2} />, iconKey: 'test', title: '试说完成', hint: '配置向导的试说：文字只显示在向导里，没有输入', tone: 'var(--lg-muted-orb)' };
   }
   if (chip.kind === 'elevated' || chip.kind === 'kept') {
-    return { icon: <ShieldAlert size={18} strokeWidth={2.2} />, iconKey: chip.kind, tone: 'var(--warn)', ...blockedChip(chip.kind, chip.text === 'copied') };
+    const [c, reason] = chip.text.split(':');
+    return { icon: <ShieldAlert size={18} strokeWidth={2.2} />, iconKey: chip.kind, tone: 'var(--warn)', ...blockedChip(chip.kind, c === 'copied', reason || 'elevated') };
   }
   if (chip.kind === 'tool') {
     const Icon = TOOL_ICON[model.tool];
@@ -149,8 +150,10 @@ export function Overlay() {
   const card = useRef<HTMLDivElement>(null);
   const noteBody = useRef<HTMLDivElement>(null);
   const [squash, animateSquash] = useAnimate();
+  const appearance = useRef<Snapshot['prefs'] | null>(null);
 
   const applyAppearance = useCallback((prefs: Snapshot['prefs']) => {
+    appearance.current = prefs;
     const root = document.documentElement;
     const still = prefs.appearance.reduced_motion || matchMedia('(prefers-reduced-motion: reduce)').matches;
     setReduced(still);
@@ -162,6 +165,13 @@ export function Overlay() {
       paintPreviewDesktop(dark);
     }
   }, []);
+  // MotionConfig gets an explicit always/never: follow the system setting while running.
+  useEffect(() => {
+    const query = matchMedia('(prefers-reduced-motion: reduce)');
+    const follow = () => { if (appearance.current) applyAppearance(appearance.current); };
+    query.addEventListener('change', follow);
+    return () => query.removeEventListener('change', follow);
+  }, [applyAppearance]);
   const { model, layout, action } = useOverlayModel(applyAppearance);
   const anchor = layout?.anchor ?? 'top-center';
   const align = alignment(anchor);
@@ -246,6 +256,8 @@ export function Overlay() {
      if its own copy is slow. Dropped if a new showing starts meanwhile. */
   const refreshWhileHidden = () => {
     exiting.current = false;
+    // Fully gone: nothing on screen may take clicks.
+    shell.overlayInteractive(null);
     const token = showing.current;
     window.setTimeout(() => {
       if (token !== showing.current || exiting.current) return;
@@ -272,6 +284,10 @@ export function Overlay() {
       shell.overlayInteractive({ x: r.left, y: r.top, width: r.width, height: r.height });
     } else shell.overlayInteractive(null);
   }, [hidden, revealed]);
+  // The exiting card keeps the props of its last render: its animation callback must read
+  // the current state, or the end of its exit registers a click region after the hide.
+  const reportRef = useRef(report);
+  reportRef.current = report;
   useLayoutEffect(() => {
     report();
     window.addEventListener('resize', report);
@@ -374,7 +390,7 @@ export function Overlay() {
                   animate={{ width: target.w, height: target.h, borderRadius: target.r }}
                   exit={{ width: 72, height: 34, borderRadius: 17, transition: reduced ? QUICK : { duration: .32, ease: EASE } }}
                   transition={shape}
-                  onAnimationComplete={report}>
+                  onAnimationComplete={() => reportRef.current()}>
                   <GlassLayers glass={glass} thick={model.view === 'note'} />
                   <div className="lg-tint" />
                   <div className="lg-tint-mode" />
@@ -615,16 +631,23 @@ function NoteView({ model, bodyRef, reduced, listening, onPin, onClose }: {
   onPin: () => void; onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const reset = useRef(0);
   const scroller = useRef<HTMLDivElement>(null);
   const text = shownText(model);
+  // The card stays mounted from one note to the next: "已复制" belongs to its own session.
+  useEffect(() => { clearTimeout(reset.current); setCopied(false); }, [model.startedAt]);
+  useEffect(() => () => clearTimeout(reset.current), []);
   useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: reduced ? 'auto' : 'smooth' }); }, [text, reduced]);
+  // The session ended without a result (cancelled, or the core exited): never "正在整理…".
+  const stopped = !model.done && !isBusy(model.phase);
   const stage = listening ? 'listening' : model.done ? 'answer' : model.phase === 'processing' && text ? 'thinking' : 'idle';
   async function copy() {
     if (!model.text) return;
     try {
       await call('copy_text', { text: model.text });
+      clearTimeout(reset.current);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1400);
+      reset.current = window.setTimeout(() => setCopied(false), 1400);
     } catch { /* the note is also in the main window */ }
   }
   const stagger = (i: number) => ({ initial: { opacity: 0, y: -5, filter: 'blur(3px)' }, animate: { opacity: 1, y: 0, filter: 'blur(0px)' }, transition: { delay: .12 + i * .04, duration: .3, ease: EASE } });
@@ -634,6 +657,7 @@ function NoteView({ model, bodyRef, reduced, listening, onPin, onClose }: {
   const caption = listening ? '说完显示文字 · 再按一下结束并保存'
     : model.phase === 'processing' ? '马上显示整理好的文字' : model.phase === 'starting' ? '开头的声音已暂存' : '';
   const footer = model.savedAt ? `已保存于 ${clock(model.savedAt)}`
+    : stopped ? '本段没有完成，未保存'
     : listening ? (!text ? '声线随音量变化 · 结束后定稿' : '实时文字 · 结束后定稿')
       : model.phase === 'starting' ? '正在接入语音引擎' : '正在识别完整内容';
   return (
@@ -643,12 +667,13 @@ function NoteView({ model, bodyRef, reduced, listening, onPin, onClose }: {
         <motion.span {...stagger(1)} className="text-[13.5px] font-bold tracking-tight" data-tauri-drag-region>笔记</motion.span>
         <motion.span {...stagger(2)} className="flex items-center gap-1.5 text-[12px] font-semibold" data-tauri-drag-region>
           <AnimatePresence mode="popLayout" initial={false}>
-            <motion.span key={listening ? 'listen' : model.done ? 'done' : model.phase} className="flex items-center gap-1.5"
+            <motion.span key={listening ? 'listen' : model.done ? 'done' : stopped ? 'stopped' : model.phase} className="flex items-center gap-1.5"
               initial={{ opacity: 0, y: 6, filter: 'blur(3px)' }} animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }} exit={{ opacity: 0, y: -6, filter: 'blur(3px)' }} transition={ROLL}>
               {listening ? <><i className="rec-dot" />正在听 <span className="lg-faint"><Elapsed since={model.startedAt} /></span></>
                 : model.done ? <span style={{ color: 'var(--lg-ok)' }} className="flex items-center gap-1"><DrawCheck size={13} />已保存</span>
                   : model.phase === 'starting' ? <span className="lg-faint">正在接入…</span>
-                    : <span className="shimmer">正在整理…</span>}
+                    : stopped ? <span className="lg-faint">已中断</span>
+                      : <span className="shimmer">正在整理…</span>}
             </motion.span>
           </AnimatePresence>
         </motion.span>

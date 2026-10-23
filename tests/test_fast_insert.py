@@ -56,7 +56,7 @@ class TypingTests(unittest.TestCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(len(asr.sessions), 1)
         self.assertEqual([event['text'] for event in events if event.get('type') == 'result'], ['前缀后缀'])
-        self.assertTrue(any('部分文字' in event.get('message', '') for event in events))
+        self.assertEqual(events[-1]['not_typed'], 'partial')
 
 
 

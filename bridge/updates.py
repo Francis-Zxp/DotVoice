@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 REPOSITORY = 'https://github.com/Francis-Zxp/DotVoice'
 RELEASE_API = 'https://api.github.com/repos/Francis-Zxp/DotVoice/releases/latest'
 CHECK_INTERVAL = 6 * 60 * 60
+RETRY_AFTER_ERROR = 20 * 60  # offline (at logon, before Wi-Fi): look again soon, not in six hours
 MAX_RESPONSE = 512 * 1024
 VERSION = re.compile(r'(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})', re.ASCII)
 
@@ -81,6 +82,7 @@ class UpdateWatch:
         self._request_lock = threading.Lock()
         self._release = None
         self._last_checked = None
+        self._retry_at = None  # after a network failure: the next automatic check, earlier
         self._error = ''
         self._dismissed = ''
         self._checking = False
@@ -101,6 +103,9 @@ class UpdateWatch:
             checked = data.get('last_checked')
             if type(checked) in (int, float) and math.isfinite(checked) and checked >= 0:
                 self._last_checked = checked
+            retry = data.get('retry_at')
+            if type(retry) in (int, float) and math.isfinite(retry) and retry >= 0:
+                self._retry_at = retry  # a restart soon after a failed check still retries early
             ignored = data.get('dismissed_version')
             if isinstance(ignored, str) and VERSION.fullmatch(ignored):
                 self._dismissed = ignored
@@ -116,7 +121,7 @@ class UpdateWatch:
             temp = self.path.with_suffix('.tmp')
             temp.write_text(json.dumps({
                 'release': self._release, 'last_checked': self._last_checked,
-                'dismissed_version': self._dismissed, 'error': self._error,
+                'retry_at': self._retry_at, 'dismissed_version': self._dismissed, 'error': self._error,
             }, ensure_ascii=False), encoding='utf-8')
             temp.replace(self.path)
         except OSError:
@@ -124,8 +129,13 @@ class UpdateWatch:
 
     def due(self):
         with self._lock:
-            age = None if self._last_checked is None else self._clock() - self._last_checked
-            return not self._checking and (age is None or age < 0 or age >= CHECK_INTERVAL)
+            if self._checking:
+                return False
+            now = self._clock()
+            if self._retry_at is not None and now >= self._retry_at:
+                return True
+            age = None if self._last_checked is None else now - self._last_checked
+            return age is None or age < 0 or age >= CHECK_INTERVAL
 
     def snapshot(self):
         with self._lock:
@@ -153,21 +163,26 @@ class UpdateWatch:
                     return self.snapshot()
                 self._checking = True
                 self._last_checked = self._clock()
-            release, error = None, ''
+            release, error, transient = None, '', False
             try:
                 release = _parse(self._fetch())
             except HTTPError as exc:
                 error = ('尚无公开发行版，请稍后重试' if exc.code == 404 else
                          'GitHub 暂时限制更新检查，请稍后重试' if exc.code in (403, 429) else
                          'GitHub 更新服务暂不可用，请稍后重试')
+                transient = exc.code >= 500
             except (URLError, OSError, TimeoutError, HTTPException):
                 error = '无法连接 GitHub，请检查网络后重试'
+                transient = True
             except (ValueError, TypeError) as exc:
                 error = str(exc) or '发行版信息无效'
             with self._lock:
                 if release is not None:
                     self._release = release
                 self._error = error
+                # A network failure retries soon; a rate limit or a missing release keeps the
+                # six-hour interval.
+                self._retry_at = self._clock() + RETRY_AFTER_ERROR if transient else None
                 self._checking = False
                 self._save()
                 return self.snapshot()

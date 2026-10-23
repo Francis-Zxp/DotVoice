@@ -135,6 +135,16 @@ try {
       assert.ok((await card.innerText()).includes(`发现新版本 ${version}`));
     }
   });
+  await check('a background check in progress shows as checking and cannot be started twice', async () => {
+    const card = page.locator('[data-update-settings]');
+    await update('0.11.9', { status: 'checking', available: false });
+    const button = card.getByRole('button', { name: '正在检查', exact: true });
+    await button.waitFor();
+    assert.ok(await button.isDisabled());
+    assert.match(await card.innerText(), /正在检查 GitHub 发行版/);
+    await update('0.11.9', { status: 'current', available: false });
+    assert.ok(await card.getByRole('button', { name: '检查更新', exact: true }).isEnabled());
+  });
   await check('no rendering exceptions', async () => assert.deepEqual(errors, []));
 } finally {
   await browser.close();

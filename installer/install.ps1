@@ -24,7 +24,7 @@ try {
     if ($live) { throw '请右键托盘图标退出点声，然后重新安装。' }
     if (!$Silent) {
         Add-Type -AssemblyName System.Windows.Forms
-        $choice = [Windows.Forms.MessageBox]::Show("将点声安装到：`n$target`n`n会添加桌面和开始菜单快捷方式，并登记到 Windows 已安装的应用。", '安装点声 0.11.6', 'OKCancel', 'Information')
+        $choice = [Windows.Forms.MessageBox]::Show("将点声安装到：`n$target`n`n会添加桌面和开始菜单快捷方式，并登记到 Windows 已安装的应用。", '安装点声 0.11.8', 'OKCancel', 'Information')
         if ($choice -ne 'OK') { exit 0 }
     }
     New-Item -ItemType Directory -Path $programs -Force | Out-Null
@@ -44,7 +44,7 @@ try {
             Copy-Item -LiteralPath $copy[0] -Destination $copy[1]
         }
         Copy-Item -LiteralPath $manifest -Destination (Join-Path $target 'installed-files.json')
-        '{"version":"0.11.6","scope":"current-user"}' | Set-Content -LiteralPath (Join-Path $target 'installed.json') -Encoding UTF8
+        '{"version":"0.11.8","scope":"current-user"}' | Set-Content -LiteralPath (Join-Path $target 'installed.json') -Encoding UTF8
         $shell = New-Object -ComObject WScript.Shell
         foreach ($folder in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {
             $shortcut = $shell.CreateShortcut((Join-Path $folder '点声 DotVoice.lnk'))
@@ -56,7 +56,7 @@ try {
         }
         New-Item -Path $registryKey -Force | Out-Null
         $uninstall = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $target 'uninstall.ps1') + '"'
-        $props = @{ DisplayName='点声 DotVoice'; DisplayVersion='0.11.6'; Publisher='DotVoice'; InstallLocation=$target; DisplayIcon=(Join-Path $target 'DotVoice.exe'); UninstallString=$uninstall; QuietUninstallString=($uninstall + ' -Silent'); InstallDate=(Get-Date -Format 'yyyyMMdd') }
+        $props = @{ DisplayName='点声 DotVoice'; DisplayVersion='0.11.8'; Publisher='DotVoice'; InstallLocation=$target; DisplayIcon=(Join-Path $target 'DotVoice.exe'); UninstallString=$uninstall; QuietUninstallString=($uninstall + ' -Silent'); InstallDate=(Get-Date -Format 'yyyyMMdd') }
         foreach ($key in $props.Keys) { New-ItemProperty -Path $registryKey -Name $key -Value $props[$key] -PropertyType String -Force | Out-Null }
         foreach ($key in @('NoModify','NoRepair')) { New-ItemProperty -Path $registryKey -Name $key -Value 1 -PropertyType DWord -Force | Out-Null }
     } catch {

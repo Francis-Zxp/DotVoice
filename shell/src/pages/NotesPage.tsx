@@ -8,6 +8,8 @@ import { runs, suggestTag } from '../lib/transcript';
 import type { Note } from '../lib/types';
 
 const INBOX = '__inbox__';
+/* Unsaved 整理稿 per note: they survive switching notes or pages (cleared on save, 取消 and delete). */
+const drafts = new Map<string, string>();
 
 export function NotesPage() {
   const notes = useStore((s) => s.notes);
@@ -17,7 +19,9 @@ export function NotesPage() {
   const notify = useStore((s) => s.notify);
   const [filter, setFilter] = useState<string>('');
   const [query, setQuery] = useState('');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Back on the page, a note with an unsaved draft opens first.
+  const [selectedId, setSelectedId] = useState<string | null>(() => drafts.keys().next().value ?? null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const search = useRef<HTMLInputElement>(null);
 
   useEffect(() => { refresh(); }, [refresh]);
@@ -30,6 +34,8 @@ export function NotesPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
   useEffect(() => { if (warning) notify(warning, 'error'); }, [warning, notify]);
+  // A tag no note carries any more: back to 全部 (otherwise nothing matches and no chip is on).
+  useEffect(() => { if (filter && filter !== INBOX && !tags.includes(filter)) setFilter(''); }, [filter, tags]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -50,11 +56,13 @@ export function NotesPage() {
     return result;
   }, [visible]);
 
-  const current = visible.find((n) => n.id === selectedId) ?? visible[0] ?? null;
+  // The note being edited stays open even when a tag change takes it out of the filter.
+  const current = visible.find((n) => n.id === selectedId) ?? notes.find((n) => n.id === editingId) ?? visible[0] ?? null;
   const inboxCount = notes.filter((n) => n.tags.length === 0).length;
 
   async function remove(note: Note) {
     if (!(await act('delete_note', { identifier: note.id }))) return;
+    drafts.delete(note.id);
     await refresh();
     notify('已删除这条笔记', 'info', {
       label: '撤销',
@@ -141,7 +149,7 @@ export function NotesPage() {
           <AnimatePresence mode="wait" initial={false}>
             {current ? (
               <DetailPane key={current.id} id={current.id}>
-                <NoteDetail note={current} allTags={tags} onDelete={() => remove(current)} onEdit={() => setSelectedId(current.id)} />
+                <NoteDetail note={current} allTags={tags} onDelete={() => remove(current)} onEdit={() => setSelectedId(current.id)} onEditing={setEditingId} />
               </DetailPane>
             ) : (
               <motion.div key="empty" className="m-auto max-w-[380px] text-center" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
@@ -220,15 +228,26 @@ function TagEditor({ note, allTags }: { note: Note; allTags: string[] }) {
   );
 }
 
-function NoteDetail({ note, allTags, onDelete, onEdit }: { note: Note; allTags: string[]; onDelete: () => void; onEdit: () => void }) {
+function NoteDetail({ note, allTags, onDelete, onEdit, onEditing }: {
+  note: Note; allTags: string[]; onDelete: () => void; onEdit: () => void; onEditing: (id: string | null) => void;
+}) {
   const refresh = useStore((s) => s.refreshNotes);
   const notify = useStore((s) => s.notify);
   const [source, setSource] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(note.text);
+  // A draft left unsaved here earlier reopens in the editor.
+  const [editing, setEditing] = useState(() => drafts.has(note.id));
+  const [draft, setDraftState] = useState(() => drafts.get(note.id) ?? note.text);
+  const setDraft = (text: string) => { drafts.set(note.id, text); setDraftState(text); };
+  const stopEditing = () => { drafts.delete(note.id); setEditing(false); };
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const text = source ? note.source : note.text;
+
+  useEffect(() => {
+    if (!editing) return;
+    onEditing(note.id);
+    return () => onEditing(null);
+  }, [editing, note.id, onEditing]);
 
   async function save() {
     if (savingRef.current) return;
@@ -237,7 +256,7 @@ function NoteDetail({ note, allTags, onDelete, onEdit }: { note: Note; allTags: 
     try {
       if (await act('update_note', { identifier: note.id, text: draft })) {
         await refresh();
-        setEditing(false);
+        stopEditing();
         notify('整理稿已保存，服务返回稿保留不变', 'success');
       }
     } finally {
@@ -268,7 +287,7 @@ function NoteDetail({ note, allTags, onDelete, onEdit }: { note: Note; allTags: 
           ))}
         </div>
         <div className="ml-auto flex items-center gap-1">
-          {!editing && <button className="btn btn-ghost btn-sm" disabled={source} onClick={() => { onEdit(); setDraft(note.text); setEditing(true); }}><Pencil size={14} />编辑</button>}
+          {!editing && <button className="btn btn-ghost btn-sm" disabled={source} onClick={() => { onEdit(); setDraftState(note.text); setEditing(true); }}><Pencil size={14} />编辑</button>}
           <button className="btn btn-ghost btn-sm" onClick={copy}><Copy size={14} />复制</button>
           <button className="btn btn-ghost btn-sm btn-danger" disabled={saving} onClick={onDelete} title="删除（可撤销）"><Trash2 size={14} />删除</button>
         </div>
@@ -279,7 +298,7 @@ function NoteDetail({ note, allTags, onDelete, onEdit }: { note: Note; allTags: 
             <textarea className="field min-h-[260px] text-[15px]" disabled={saving} value={draft} onChange={(e) => setDraft(e.target.value)} aria-label="编辑整理稿" autoFocus />
             <div className="mt-3 flex gap-2">
               <button className="btn btn-primary btn-sm" disabled={saving} onClick={save}><Check size={14} />{saving ? '正在保存…' : '保存修改'}</button>
-              <button className="btn btn-ghost btn-sm" disabled={saving} onClick={() => setEditing(false)}><X size={14} />取消</button>
+              <button className="btn btn-ghost btn-sm" disabled={saving} onClick={stopEditing}><X size={14} />取消</button>
             </div>
           </>
         ) : (

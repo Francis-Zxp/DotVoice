@@ -29,6 +29,8 @@ const go = async (page, label) => {
   await page.waitForFunction((l) => document.querySelector('.nav-item[aria-current="page"]')?.textContent?.includes(l), label);
   await page.waitForTimeout(350);
 };
+// How often the page has called a core method (the mock's call log).
+const called = (page, method) => page.evaluate((m) => window.__demo.calls.filter((c) => c === m).length, method);
 // The brand colour as the page resolves it, under the OS palette (theme null) or a
 // forced data-theme: the swatch's --brand and a probe .btn-primary's gradient.
 const brandOf = (page, theme) => page.evaluate((theme) => {
@@ -212,6 +214,76 @@ try {
     await page.waitForFunction(() => !document.querySelector('[data-roster="baseus:3f9a12c0"]')?.textContent?.includes('正在录音'), null, { timeout: 20000 });
   });
 
+  await check('the recording timer keeps counting across a page switch', async () => {
+    await page.waitForFunction(() => window.__demo.snap.state.phase === 'idle', null, { timeout: 20000 });
+    await go(page, '语音');
+    await page.evaluate(() => window.__demo.play('input'));
+    await page.waitForFunction(() => window.__demo.snap.state.phase === 'recording', null, { timeout: 5000 });
+    await page.waitForTimeout(1600);
+    await go(page, '笔记');
+    await go(page, '语音');
+    const text = await page.locator('section.stage header').innerText();
+    const time = /正在听\s*(\d+):(\d{2})/.exec(text);
+    assert.ok(time && Number(time[1]) * 60 + Number(time[2]) >= 2, `the timer restarted: ${text}`);
+    await page.waitForFunction(() => window.__demo.snap.state.phase === 'idle', null, { timeout: 15000 });
+  });
+
+  await check('a switch deferred to the end of the recording is cancelled by clicking the current mode', async () => {
+    await page.evaluate(() => {
+      window.__demo.state('recording');
+      window.__demo.emit('mode', { value: window.__demo.snap.destination, pending: 'present', source: 'key', armed: true });
+    });
+    const badge = page.locator('aside .chip', { hasText: '本段后' });
+    await badge.waitFor({ timeout: 3000 });
+    const before = await called(page, 'set_mode');
+    await page.locator('aside button[aria-pressed="true"]').click();
+    await badge.waitFor({ state: 'detached', timeout: 3000 });
+    assert.equal(await called(page, 'set_mode'), before + 1);
+    // The title-bar switch too.
+    await page.evaluate(() => window.__demo.emit('mode', { value: window.__demo.snap.destination, pending: 'present', source: 'key', armed: true }));
+    const dot = page.locator('header .pending-dot');
+    await dot.waitFor({ timeout: 3000 });
+    await page.locator('header[data-tauri-drag-region] button[aria-pressed="true"]').click();
+    await dot.waitFor({ state: 'detached', timeout: 3000 });
+    await page.evaluate(() => window.__demo.state('idle'));
+  });
+
+  await check('reduced motion keeps the main button ring still while listening', async () => {
+    const prefs = await page.evaluate(() => window.__demo.snap.prefs);
+    try {
+      await page.evaluate((p) => window.__demo.emit('prefs', { ...p, appearance: { ...p.appearance, reduced_motion: true } }), prefs);
+      await page.evaluate(() => window.__demo.state('recording'));
+      await page.locator('.orb-wrap[data-listening="true"]').waitFor();
+      for (const level of [0.01, 0.2, 0.05]) {
+        await page.evaluate((l) => window.__demo.emit('level', l), level);
+        await page.waitForTimeout(60);
+      }
+      assert.equal(await page.locator('.orb-wrap .orb-ring').evaluate((el) => el.style.transform), '');
+    } finally {
+      await page.evaluate((p) => { window.__demo.emit('prefs', p); window.__demo.state('idle'); }, prefs);
+    }
+  });
+
+  await check('a resting score repaints its voice lines when Windows switches to dark', async () => {
+    const ink = () => page.evaluate(() => {
+      const c = document.querySelector('.voice-transcript canvas');
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let n = 0, sum = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 40) { n++; sum += d[i] + d[i + 1] + d[i + 2]; }
+      return n ? sum / n / 3 : -1;
+    });
+    await page.waitForTimeout(1800);  // the answer's reveal has finished: the canvas is at rest
+    const light = await ink();
+    try {
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await page.waitForTimeout(400);
+      const dark = await ink();
+      assert.ok(light >= 0 && light < 120 && dark > 150, `ink ${light} → ${dark}`);
+    } finally {
+      await page.emulateMedia({ colorScheme: 'light' });
+    }
+  });
+
   await check('Ctrl+number switches pages', async () => {
     await page.keyboard.press('Control+2');
     await page.waitForFunction(() => document.querySelector('.nav-item[aria-current="page"]')?.textContent?.includes('笔记'));
@@ -258,6 +330,44 @@ try {
     await page.waitForFunction((n) => document.querySelectorAll('[data-note-id]').length === n, before);
   });
 
+  await check('removing the last note of a tag filter falls back to 全部 (never an empty filter with no chip on)', async () => {
+    const group = page.locator('[role="group"][aria-label="按标签筛选"]');
+    await group.locator('button', { hasText: '试验' }).click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-note-id]').length === 1);
+    await page.waitForFunction(() => document.querySelectorAll('[data-note-detail]').length === 1);
+    await page.getByRole('button', { name: '移除标签 试验' }).click();
+    await group.locator('button[aria-pressed="true"]', { hasText: '全部' }).waitFor({ timeout: 3000 });
+    assert.equal(await group.locator('button', { hasText: '试验' }).count(), 0);
+    assert.ok(await page.locator('[data-note-id]').count() > 1);
+  });
+
+  await check('an unsaved 整理稿 survives opening another note and leaving the page', async () => {
+    const items = page.locator('[data-note-id]');
+    const [first, second] = [await items.nth(0).getAttribute('data-note-id'), await items.nth(1).getAttribute('data-note-id')];
+    const shown = (id) => page.waitForFunction((id) => {
+      const panes = document.querySelectorAll('[data-note-detail]');
+      return panes.length === 1 && panes[0].getAttribute('data-note-detail') === id;
+    }, id);
+    await items.nth(0).click();
+    await shown(first);
+    await page.getByRole('button', { name: '编辑', exact: true }).click();
+    const editor = page.getByRole('textbox', { name: '编辑整理稿' });
+    await editor.fill('未保存的草稿内容');
+    await page.locator(`[data-note-id="${second}"]`).click();
+    await shown(second);
+    assert.equal(await editor.count(), 0);
+    await page.locator(`[data-note-id="${first}"]`).click();
+    await shown(first);
+    assert.equal(await editor.inputValue(), '未保存的草稿内容', 'back on the note: the draft is still there');
+    await go(page, '设备');
+    await go(page, '笔记');
+    await shown(first);
+    assert.equal(await editor.inputValue(), '未保存的草稿内容', 'back on the page: the draft is still there');
+    await page.getByRole('button', { name: '取消', exact: true }).click();
+    await editor.waitFor({ state: 'detached' });
+    assert.ok(!(await page.locator('[data-note-detail]').innerText()).includes('未保存的草稿内容'));
+  });
+
   await check('search filters notes, Esc clears it', async () => {
     const before = await page.locator('[data-note-id]').count();
     const box = page.getByRole('textbox', { name: '搜索笔记' });
@@ -290,6 +400,48 @@ try {
     await page.getByRole('textbox', { name: '笔的名称' }).press('Escape');
     assert.ok(!(await page.locator('main').innerText()).includes('不要保存'));
     await page.screenshot({ path: resolve(shots, 'devices-renamed.png') });
+  });
+
+  await check('a pen name: at most 16 characters, a failed rename keeps the input, empty restores the default', async () => {
+    await page.getByRole('button', { name: /重命名 会议室/ }).click();
+    const input = page.getByRole('textbox', { name: '笔的名称' });
+    assert.equal(await input.getAttribute('maxlength'), '16');
+    await page.evaluate(() => window.__demo.fail('rename_instance', '名称没能保存'));
+    await input.fill('第二会议室');
+    await input.press('Enter');
+    await page.locator('.toast', { hasText: '名称没能保存' }).waitFor({ timeout: 3000 });
+    assert.equal(await input.inputValue(), '第二会议室', 'the typed name is kept');
+    await input.fill('');
+    await input.press('Enter');
+    await page.locator('[data-instance="baseus:3f9a12c0"]', { hasText: '倍思 #1' }).waitFor({ timeout: 3000 });
+    await page.locator('.toast', { hasText: '已恢复默认名称' }).waitFor({ timeout: 3000 });
+  });
+
+  await check('changing only the PV60 recording mode says what changed, not "已切换设备"', async () => {
+    await page.evaluate(() => window.__demo.state('disconnected'));
+    const card = (name) => page.locator('article', { hasText: name }).filter({ has: page.getByRole('button', { name: /使用这个型号|已选择/ }) });
+    try {
+      await card('汉王 PV60').getByRole('button', { name: '使用这个型号' }).click();
+      await page.locator('.toast', { hasText: '已切换设备' }).waitFor({ timeout: 3000 });
+      await page.locator('[role="group"][aria-label="PV60 录音方式"]').getByRole('button', { name: '单击切换' }).click();
+      await page.locator('.toast', { hasText: '已改为单击切换' }).waitFor({ timeout: 3000 });
+    } finally {
+      await page.evaluate(() => window.__demo.state('disconnected'));
+      await card('倍思 BS-OH085').getByRole('button', { name: '使用这个型号' }).click();
+      await page.waitForFunction(() => window.__demo.snap.selected === 'baseus');
+      await page.evaluate(() => window.__demo.state('idle'));
+      await page.evaluate(() => document.querySelectorAll('.toast button[aria-label="关闭提示"]').forEach((b) => b.click()));
+    }
+  });
+
+  await check('a tooltip opened by keyboard focus closes when the page scrolls', async () => {
+    const na = page.locator('main [data-battery-na][tabindex="0"]');
+    await na.focus();
+    const tip = page.getByRole('tooltip');
+    await tip.waitFor({ timeout: 3000 });
+    await page.evaluate(() => { const main = document.getElementById('main'); main.scrollTop += 120; main.dispatchEvent(new Event('scroll')); });
+    await tip.waitFor({ state: 'detached', timeout: 2000 });
+    await page.evaluate(() => { document.activeElement?.blur(); document.getElementById('main').scrollTop = 0; });
   });
 
   await check('present tools can be chosen in settings', async () => {
@@ -362,6 +514,13 @@ try {
     await page.waitForFunction(() => window.__demo.snap.prefs.engine.polish.base_url === 'https://api.example.com/v1');
     await page.waitForFunction(() => !document.querySelector('[data-polish-incomplete]')?.textContent?.includes('Base URL'));
     assert.match(await incomplete.innerText(), /还缺 模型/);
+    // Esc leaves a text field without saving what was typed.
+    await page.getByLabel('润色模型').fill('esc-model');
+    await page.getByLabel('润色模型').press('Escape');
+    assert.equal(await page.getByLabel('润色模型').inputValue(), '', 'Esc restores the field');
+    await page.waitForTimeout(200);
+    assert.equal(await page.evaluate(() => window.__demo.snap.prefs.engine.polish.model), '', 'Esc never saves');
+    assert.equal(await page.locator('.field-wrap', { has: page.getByLabel('润色模型') }).locator('.field-ok').count(), 0, 'no "已保存" tick');
     await page.screenshot({ path: resolve(shots, 'polish-incomplete.png') });
     await polish.getByRole('button', { name: '原文' }).click();
     await page.getByLabel('润色 Base URL').waitFor({ state: 'detached' });
@@ -417,6 +576,27 @@ try {
     console.log(`  contrast text/glyph: ${found.join(', ')}`);
   });
 
+  // 百炼 and 其他语音软件 once used their fill colour for text: the 实验 badge was 2.5:1 in light.
+  await check('百炼 and 其他语音软件 card icons and the 实验 badge stay legible in light, dark and glass', async () => {
+    const card = (kind) => page.locator(`.engine-card[data-engine="${kind}"]`);
+    const was = await page.evaluate(() => document.documentElement.dataset.theme ?? null);
+    const found = [];
+    try {
+      for (const theme of ['light', 'dark', 'glass']) {
+        await page.evaluate((t) => { document.documentElement.dataset.theme = t; }, theme);
+        await page.waitForTimeout(800);
+        const badge = await contrastOf(page, card('hotkey').locator('.engine-badge'));
+        const icons = [await contrastOf(page, card('dashscope').locator('.engine-ico')), await contrastOf(page, card('hotkey').locator('.engine-ico'))];
+        found.push(`${theme} ${badge.toFixed(2)}/${icons.map((r) => r.toFixed(2)).join('/')}`);
+        assert.ok(badge >= 4.5, `${theme}: 实验 is ${badge.toFixed(2)}:1 (needs 4.5)`);
+        for (const icon of icons) assert.ok(icon >= 3, `${theme}: an engine icon is ${icon.toFixed(2)}:1 (needs 3)`);
+      }
+    } finally {
+      await page.evaluate((t) => { if (t === null) delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t; }, was);
+    }
+    console.log(`  contrast badge/icons: ${found.join(', ')}`);
+  });
+
   await check('new preferences are wired: 气声识别, 随拿随用, 拦截放映快捷键, 桌面图标状态点, 在线文字与调试录音', async () => {
     const prefs = () => page.evaluate(() => window.__demo.snap.prefs);
     const whisper = page.locator('[role="group"][aria-label="气声识别"]');
@@ -469,6 +649,125 @@ try {
     await page.evaluate(() => { window.__demo.elevation.elevated = false; });
   });
 
+  await check('启动时恢复上次的语音启用状态: on by default, explained, and the switch writes general.restore_armed', async () => {
+    await go(page, '设置');
+    const section = page.locator('#set-general');
+    const toggle = page.getByRole('switch', { name: '启动时恢复上次的语音启用状态' });
+    assert.equal(await toggle.isChecked(), true, 'on by default');
+    assert.ok((await section.innerText()).includes('关闭后，每次启动需要手动点「启用语音」'));
+    await toggle.click();
+    await page.waitForFunction(() => window.__demo.snap.prefs.general.restore_armed === false);
+    assert.equal(await toggle.isChecked(), false);
+    assert.equal(await page.evaluate(() => window.__demo.snap.prefs.general.run_elevated), false, 'the elevation setting is untouched');
+    await toggle.click();
+    await page.waitForFunction(() => window.__demo.snap.prefs.general.restore_armed === true);
+    // An older core without the preference: shown as on.
+    const prefs = await page.evaluate(() => window.__demo.snap.prefs);
+    await page.evaluate((p) => window.__demo.emit('prefs', { ...p, general: { run_elevated: false } }), prefs);
+    assert.equal(await toggle.isChecked(), true, 'a missing value reads as on');
+    await page.evaluate((p) => window.__demo.emit('prefs', p), prefs);
+  });
+
+  await check('shortcut fields: Tab moves on, and Shift+Tab or a bare F5 never become global shortcuts', async () => {
+    const field = page.getByRole('textbox', { name: '切换模式快捷键' });
+    const focused = () => field.evaluate((el) => el === document.activeElement);
+    await field.focus();
+    await page.keyboard.press('Tab');
+    assert.equal(await focused(), false, 'Tab left the field');
+    await field.focus();
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await focused(), false, 'Shift+Tab left the field');
+    await field.focus();
+    await page.keyboard.press('F5');
+    assert.equal(await focused(), true, 'a bare F5 is not taken: still recording');
+    assert.equal(await page.evaluate(() => window.__demo.snap.prefs.hotkeys.toggle_mode), '');
+    await page.keyboard.press('Control+Shift+M');
+    await page.waitForFunction(() => window.__demo.snap.prefs.hotkeys.toggle_mode === 'Ctrl+Shift+M');
+    await page.getByRole('button', { name: '清除快捷键' }).first().click();
+    await page.waitForFunction(() => window.__demo.snap.prefs.hotkeys.toggle_mode === '');
+  });
+
+  await check('a slider saves once when it is released, not on every step', async () => {
+    const range = page.getByRole('slider', { name: '保存后停留' });
+    await range.scrollIntoViewIfNeeded();
+    const box = await range.boundingBox();
+    const before = await called(page, 'prefs_set');
+    const y = box.y + box.height / 2;
+    await page.mouse.move(box.x + 3, y);
+    await page.mouse.down();
+    for (let i = 1; i <= 12; i++) await page.mouse.move(box.x + 3 + (box.width - 6) * i / 12, y);
+    await page.mouse.up();
+    await page.waitForFunction(() => window.__demo.snap.prefs.overlay.linger_seconds === 30, null, { timeout: 3000 });
+    assert.equal(await called(page, 'prefs_set') - before, 1, 'one save for the whole drag');
+    assert.equal(await range.inputValue(), '30');
+    // Back to 5 seconds from the keyboard (a key step is a release of its own).
+    await range.focus();
+    await page.keyboard.press('Home');
+    for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight');
+    await page.waitForFunction(() => window.__demo.snap.prefs.overlay.linger_seconds === 5, null, { timeout: 3000 });
+    await page.evaluate(() => document.activeElement?.blur());
+  });
+
+  await check('the key recording dialog keeps Ctrl+number from leaving the page; Esc ends the recording', async () => {
+    await page.locator('#set-keys').getByRole('button', { name: '录制' }).first().click();
+    const dialog = page.getByRole('dialog', { name: '录制按键' });
+    await dialog.waitFor();
+    await page.keyboard.press('Control+2');
+    await page.waitForTimeout(400);
+    assert.ok((await page.locator('.nav-item[aria-current="page"]').innerText()).includes('设置'), 'still on settings');
+    assert.equal(await dialog.count(), 1);
+    const before = await called(page, 'binding_cancel');
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'detached' });
+    assert.equal(await called(page, 'binding_cancel'), before + 1);
+  });
+
+  await check('leaving settings with the key probe off sends no probe request', async () => {
+    const before = await called(page, 'probe');
+    await go(page, '语音');
+    await go(page, '设置');
+    await go(page, '语音');
+    assert.equal(await called(page, 'probe'), before);
+  });
+
+  await check('a failed app detection says so with a retry and still offers 自定义快捷键', async () => {
+    await page.evaluate(() => window.__demo.fail('hotkey_detect'));
+    await go(page, '设置');
+    await page.locator('.engine-card[data-engine="hotkey"]').click();
+    const failed = page.locator('[data-detect-failed]');
+    await failed.waitFor({ timeout: 3000 });
+    assert.equal(await page.locator('.app-tile[data-profile="custom"]').count(), 1, '自定义快捷键 is offered');
+    await failed.getByRole('button', { name: '重试' }).click();
+    await page.locator('.app-tile[data-profile="shandianshuo"]').waitFor({ timeout: 3000 });
+    assert.equal(await failed.count(), 0);
+    await page.locator('.engine-card[data-engine="openless"]').click();
+  });
+
+  await check('without a running cycle the battery page and the voice sidebar say 累计, not 本轮', async () => {
+    const usage = await page.evaluate(() => window.__demo.snap.usage);
+    try {
+      await page.evaluate((u) => window.__demo.emit('usage', { ...u, active: null }), usage);
+      await go(page, '续航');
+      await page.locator('main', { hasText: '说话时长（累计）' }).waitFor({ timeout: 3000 });
+      await go(page, '语音');
+      assert.match(await page.locator('aside').innerText(), /累计\s*158\s*段/);
+    } finally {
+      await page.evaluate((u) => window.__demo.emit('usage', u), usage);
+    }
+  });
+
+  await check('usage / device-name file warnings are shown on the battery page, and only while there are any', async () => {
+    const usage = await page.evaluate(() => window.__demo.snap.usage);
+    try {
+      await page.evaluate((u) => window.__demo.emit('usage', { ...u, warning: '设备名称未能保存；重启后可能恢复默认名称。' }), usage);
+      await go(page, '续航');
+      await page.locator('main [data-usage-warning] .banner', { hasText: '设备名称未能保存' }).waitFor({ timeout: 3000 });
+    } finally {
+      await page.evaluate((u) => window.__demo.emit('usage', u), usage);
+    }
+    await page.locator('main [data-usage-warning]').waitFor({ state: 'detached', timeout: 3000 });
+  });
+
   await check('an administrator window that drops input says so once, and refused text is kept with a copy action', async () => {
     await page.evaluate(() => window.__demo.blocked());
     await page.locator('.toast', { hasText: '该窗口以管理员权限运行，系统拦截了点声的模拟点击/输入。可在 设置 → 通用 → 兼容管理员权限窗口 开启' }).waitFor({ timeout: 3000 });
@@ -488,7 +787,7 @@ try {
     await go(page, '设置');
     const section = page.locator('#set-airmouse');
     const text = await section.innerText();
-    for (const want of ['单击 ⑤ = 左键', '③④ 短按始终翻页', '③ 长按 = 抓起', '④ 长按 = 右键', '6D', '按住 ⑤ + 音量 + = 上滚', '78', '79', '放映时保持原样']) assert.ok(text.includes(want), `missing ${want}`);
+    for (const want of ['单击 ⑤ = 左键', '③④ 短按始终翻页', '③ 长按 = 抓起', '④ 长按 = 右键', '6D', '按住 ⑤ + 音量 + = 上滚', '78', '79', '放映时保持原样', '普通权限运行时点不到管理员权限的窗口']) assert.ok(text.includes(want), `missing ${want}`);
     for (const gone of ['松开飞鼠键后保持', '保持时间', '确认键 ①', '键码还没有实测', '键盘上的音量键也会滚动']) assert.ok(!text.includes(gone), `still shows ${gone}`);
     const row = (slot) => section.locator(`[data-mouse-row="${slot}"]`);
     // Record ⑤ + volume + (the mock answers with 78 after one press); ⑤ may be held meanwhile.
@@ -520,6 +819,53 @@ try {
     await dialog.getByText('7B').waitFor({ timeout: 4000 });
     await dialog.getByRole('button', { name: '取消' }).click();
     await dialog.waitFor({ state: 'detached' });
+  });
+
+  await check('a cleared default key (长按 ⑦) can be restored from the keys card', async () => {
+    await go(page, '设置');
+    const row = page.locator('#set-keys .binding-row').filter({ hasText: '切换模式' });
+    await row.getByRole('button', { name: '解除绑定' }).click();
+    await row.filter({ hasText: '未绑定' }).waitFor();
+    await row.getByRole('button', { name: '恢复默认' }).click();
+    await row.filter({ hasText: '长按翻译键 ⑦' }).waitFor();
+    assert.equal(await row.getByRole('button', { name: '恢复默认' }).count(), 0, 'a default binding offers no restore');
+  });
+
+  await check('a Hanvon PV60 is told to press its voice key, never ⑥ or ⑦', async () => {
+    await go(page, '语音');
+    const before = await page.evaluate(() => ({ devices: window.__demo.snap.devices, selected: window.__demo.snap.selected, phase: window.__demo.snap.state.phase }));
+    const flat = () => page.evaluate(() => document.querySelector('main').textContent.replace(/\s/g, ''));
+    try {
+      await page.evaluate(() => { window.__demo.emit('devices', { devices: window.__demo.snap.devices, selected: 'pv60' }); window.__demo.state('disconnected', ''); });
+      await page.waitForFunction(() => document.querySelector('main').textContent.replace(/\s/g, '').includes('按笔上的语音键开始说话'), null, { timeout: 3000 });
+      assert.ok(!(await flat()).includes('⑥开始说话'));
+      // Ready: the footer names the voice key, and no ⑦ hint is offered (PV60 has no ⑦ bound).
+      await page.evaluate(() => window.__demo.state('idle', ''));
+      await page.waitForFunction(() => document.querySelector('main').textContent.replace(/\s/g, '').includes('按笔上的语音键说话'), null, { timeout: 3000 });
+      const text = await flat();
+      assert.ok(!text.includes('循环切换') && !text.includes('闪念笔记') && !text.includes('按⑥'), text);
+    } finally {
+      await page.evaluate((b) => { window.__demo.emit('devices', { devices: b.devices, selected: b.selected }); window.__demo.state(b.phase, ''); }, before);
+    }
+    await page.waitForFunction(() => !document.querySelector('main').textContent.includes('语音键'), null, { timeout: 3000 });
+  });
+
+  await check('sounds and capsule: three mode cues to preview, and the position grid uses defined tokens', async () => {
+    await go(page, '设置');
+    const section = page.locator('#set-feedback');
+    assert.ok((await section.innerText()).includes('三种模式音色不同'));
+    await section.getByRole('button', { name: '切到演示' }).waitFor();
+    const grid = await page.evaluate(() => {
+      const group = document.querySelector('[aria-label="胶囊预设位置"]');
+      const off = [...group.querySelectorAll('button')].find((b) => b.getAttribute('aria-pressed') === 'false');
+      const probe = Object.assign(document.createElement('span'), { className: 'faint' });
+      group.parentElement.append(probe);
+      const out = { background: getComputedStyle(group).backgroundColor, inactive: getComputedStyle(off).color, faint: getComputedStyle(probe).color };
+      probe.remove();
+      return out;
+    });
+    assert.notEqual(grid.background, 'rgba(0, 0, 0, 0)', 'the grid has its well background');
+    assert.equal(grid.inactive, grid.faint, 'unselected positions are faint');
   });
 
   await check('every visible button has hover/press feedback (pointer + transition)', async () => {
@@ -581,6 +927,7 @@ try {
       await dialog.waitFor({ timeout: 5000 });
       assert.equal(await wiz.locator('.wizard .step').count(), 4);
       assert.equal(await wiz.locator('.wizard .step[data-state="current"]').innerText(), '设备');
+      assert.equal(await dialog.getByRole('button', { name: '稍后再说' }).getAttribute('title'), '关闭向导；下次启动点声时还会出现');
     });
     await check(`${scheme}: step 1 设备 — receiver, a live microphone level and the ⑥ key test tick`, async () => {
       await wiz.locator('.check-row', { hasText: '接收器' }).locator('.check-ico[data-ok="true"]').waitFor();
@@ -670,6 +1017,8 @@ try {
         return s.cursor !== 'pointer' || !s.transitionDuration.split(',').some((d) => parseFloat(d) > 0);
       }).map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim().slice(0, 20)));
       assert.deepEqual(bad, []);
+      // Setup is done: closing it now never promises a return at the next launch.
+      assert.equal(await dialog.getByRole('button', { name: '稍后再说' }).getAttribute('title'), '关闭向导');
       await dialog.getByRole('button', { name: '稍后再说' }).click();
       await dialog.waitFor({ state: 'detached' });
       assert.deepEqual(errors, []);
@@ -697,6 +1046,28 @@ try {
         await dialog.waitFor({ state: 'detached' });
         assert.deepEqual(errors, []);
       });
+
+      await check(`${scheme}: another engine card or step with a pasted, unsaved key asks before throwing it away`, async () => {
+        await wiz.getByRole('button', { name: '重新运行配置向导' }).click();
+        await dialog.waitFor();
+        await dialog.getByRole('button', { name: /下一步/ }).click();
+        const volc = wiz.locator('.choice[data-choice="volc"]');
+        await volc.getByRole('button', { name: '更换' }).click();
+        await dialog.getByLabel('豆包 API Key').fill('vk-unsaved-0123456789');
+        await wiz.locator('.choice[data-choice="dashscope"] .choice-head').click();
+        await dialog.locator('.wizard-confirm', { hasText: '继续会丢弃它' }).waitFor();
+        assert.equal(await volc.getAttribute('data-on'), 'true', 'still on 豆包');
+        await dialog.getByRole('button', { name: '继续填写' }).click();
+        assert.equal(await dialog.getByLabel('豆包 API Key').inputValue(), 'vk-unsaved-0123456789', 'the pasted key is still there');
+        await dialog.getByRole('button', { name: '上一步' }).click();
+        await dialog.locator('.wizard-confirm', { hasText: '继续会丢弃它' }).waitFor();
+        await dialog.getByRole('button', { name: '丢弃并继续' }).click();
+        await wiz.locator('.wizard .step[data-state="current"]', { hasText: '设备' }).waitFor();
+        await dialog.locator('.secret').waitFor({ state: 'detached' });  // the engine step has faded out
+        await dialog.getByRole('button', { name: '稍后再说' }).click();
+        await dialog.waitFor({ state: 'detached' });
+        assert.deepEqual(errors, []);
+      });
     }
     await wiz.close();
   }
@@ -718,6 +1089,22 @@ try {
     }
   });
   await narrowWizard.close();
+
+  const pvWizard = await browser.newPage({ viewport: { width: 1200, height: 800 }, reducedMotion: 'reduce' });
+  await pvWizard.goto(base + '/?wizard=1');
+  await check('a PV60 wizard says 语音键 in 试一句 and ends on its own keys (no ⑤ ⑥ ⑦ ⑧)', async () => {
+    const dialog = pvWizard.getByRole('dialog', { name: '配置向导' });
+    await dialog.waitFor({ timeout: 5000 });
+    await pvWizard.evaluate(() => window.__demo.emit('devices', { devices: window.__demo.snap.devices, selected: 'pv60' }));
+    await dialog.getByRole('button', { name: /下一步/ }).click();
+    await dialog.getByRole('button', { name: '跳过这一步' }).click();
+    await pvWizard.locator('.try-stage', { hasText: '语音键' }).waitFor({ timeout: 3000 });
+    assert.ok(!(await pvWizard.locator('.wizard-body').innerText()).includes('⑥'));
+    await dialog.getByRole('button', { name: /下一步/ }).click();
+    const text = await pvWizard.locator('[data-cheat]').innerText();
+    assert.ok(text.includes('语音键') && !/[⑤⑥⑦⑧]/.test(text), text);
+  });
+  await pvWizard.close();
 
   const standard = await browser.newPage({ viewport: { width: 1200, height: 800 }, reducedMotion: 'reduce' });
   await standard.goto(base + '/?admin=0');
@@ -830,6 +1217,52 @@ try {
     await overlay.locator('.capsule', { hasText: '已保存' }).waitFor({ timeout: 12000 });
   });
 
+  await check('a pinned note whose recording was cancelled says 已中断, never 正在整理', async () => {
+    await overlay.evaluate(() => { const d = window.__demo; d.setMode('notes', 'key'); d.state('recording'); });
+    await overlay.getByRole('button', { name: '固定便签', exact: true }).click();
+    await overlay.evaluate(() => window.__demo.state('disconnected', '本段已取消'));
+    await overlay.locator('.capsule', { hasText: '已中断' }).waitFor({ timeout: 3000 });
+    // Older status words roll out for a moment; then only the interrupted state remains.
+    await overlay.waitForFunction(() => {
+      const text = document.querySelector('.capsule')?.innerText ?? '';
+      return text.includes('本段没有完成，未保存') && !text.includes('正在整理');
+    }, null, { timeout: 3000 });
+    await overlay.getByRole('button', { name: '收起', exact: true }).click();
+    await overlay.locator('.capsule').waitFor({ state: 'detached', timeout: 3000 });
+  });
+  await check('a core that exits mid-recording ends on a chip saying the recording did not finish', async () => {
+    await overlay.evaluate(() => { const d = window.__demo; d.setMode('input', 'key'); d.state('recording'); d.emit('core_exit', { code: 1, restarting: true }); });
+    await overlay.locator('.capsule', { hasText: '本段未完成，正在自动重启' }).waitFor({ timeout: 3000 });
+    await overlay.locator('.capsule').waitFor({ state: 'detached', timeout: 6000 });
+  });
+  await check('a note copied a moment ago never shows "已复制" on the next note', async () => {
+    await overlay.evaluate(() => {
+      const d = window.__demo;
+      d.setMode('notes', 'key'); d.state('recording');
+      d.emit('result', { destination: 'notes', text: '第一条笔记。', envelope: [] }); d.state('idle');
+    });
+    await overlay.locator('.capsule', { hasText: '第一条笔记' }).waitFor({ timeout: 3000 });
+    await overlay.getByRole('button', { name: '复制', exact: true }).click();
+    await overlay.locator('.capsule button', { hasText: '已复制' }).waitFor({ timeout: 2000 });
+    await overlay.evaluate(() => window.__demo.state('recording'));
+    await overlay.waitForTimeout(250);
+    assert.equal(await overlay.locator('.capsule button', { hasText: '已复制' }).count(), 0);
+    await overlay.evaluate(() => window.__demo.state('disconnected', '本段已取消'));
+    await overlay.locator('.capsule').waitFor({ state: 'detached', timeout: 3000 });
+  });
+  // The capsule window takes clicks only inside the region the page reports; once the card is
+  // gone the last report must be "none" (0.11.7: the exit's end re-registered a 65×31 pill).
+  const hitAfterHide = async (p) => {
+    await p.evaluate(() => window.__demo.setMode('present', 'key'));
+    await p.locator('.capsule').waitFor();
+    await p.locator('.capsule').waitFor({ state: 'detached', timeout: 6000 });
+    await p.waitForTimeout(700);
+    return p.evaluate(() => window.__demo.hits.at(-1)?.rect ?? null);
+  };
+  await check('a hidden capsule leaves no click region behind (reduced motion)', async () => {
+    assert.equal(JSON.stringify(await hitAfterHide(overlay)), 'null');
+  });
+
   // Full motion: a hidden card fades out for ~.34 s, and a switch landing inside that brings
   // the same card back. 0.10.6 left its content at opacity 0 then: an empty glass pill.
   const lively = await browser.newPage({ viewport: { width: 500, height: 580 } });
@@ -851,7 +1284,72 @@ try {
       await lively.waitForTimeout(1400); // let this chip time out and fade before the next round
     }
   });
+  await check('a hidden capsule leaves no click region behind (full motion)', async () => {
+    assert.equal(JSON.stringify(await hitAfterHide(lively)), 'null');
+  });
+  await check('the capsule follows the system reduced-motion setting while it runs', async () => {
+    await lively.emulateMedia({ reducedMotion: 'reduce' });
+    await lively.waitForFunction(() => document.documentElement.classList.contains('reduced'), null, { timeout: 3000 });
+    await lively.emulateMedia({ reducedMotion: 'no-preference' });
+    await lively.waitForFunction(() => !document.documentElement.classList.contains('reduced'), null, { timeout: 3000 });
+  });
+  await check('the voice line never blanks when recording turns into recognition', async () => {
+    await lively.evaluate(() => {
+      const frames = window.__qaWave = [];
+      const sample = () => {
+        const c = document.querySelector('.capsule .lg-content canvas');
+        let ink = -1;
+        if (c && c.width) {
+          const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+          ink = 0;
+          for (let i = 3; i < d.length; i += 4) if (d[i] > 30) ink++;
+        }
+        frames.push({ thinking: !!document.querySelector('.capsule .live-tail.shimmer'), ink });
+        if (frames.length < 1500) requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+      window.__demo.play('input', { source: 'remote' });
+    });
+    await lively.locator('.capsule', { hasText: '已输入到光标处' }).waitFor({ timeout: 15000 });
+    const frames = await lively.evaluate(() => window.__qaWave);
+    const first = frames.findIndex((f) => f.thinking);
+    assert.ok(first > 0, 'saw the recognition phase');
+    const next = frames.slice(first, first + 8);
+    assert.equal(next.filter((f) => f.ink === 0).length, 0, JSON.stringify(frames.slice(Math.max(0, first - 2), first + 8)));
+    await lively.locator('.capsule').waitFor({ state: 'detached', timeout: 6000 });
+  });
   await lively.close();
+
+  // Present-mode stage (browser preview: the mouse stands in for the pen's cursor stream).
+  const stage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await stage.addInitScript(() => {
+    window.__frames = 0;
+    const raf = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = (callback) => { window.__frames++; return raf(callback); };
+  });
+  await stage.goto(base + '/stage.html');
+  await stage.waitForFunction(() => window.__demo);
+  await check('stage: a core exit forgets the latched laser, and an idle stage stops drawing under a moving pointer', async () => {
+    const alpha = () => stage.evaluate(() => document.querySelector('canvas').getContext('2d').getImageData(400, 300, 1, 1).data[3]);
+    const wiggle = async () => { for (let i = 0; i < 6; i++) { await stage.mouse.move(400 + (i % 2), 300); await stage.waitForTimeout(60); } };
+    await stage.mouse.move(400, 300);
+    await stage.evaluate(() => window.__demo.emit('pointer', { tool: 'laser', active: true, latched: true }));
+    await wiggle();
+    assert.ok(await alpha() > 0, 'the latched laser shows');
+    // The core dies while ② is latched; the restarted one never sends latched:false.
+    await stage.evaluate(() => window.__demo.emit('core_exit', { code: 1, restarting: true }));
+    await stage.evaluate(() => window.__demo.emit('pointer', { tool: 'spotlight', active: true }));
+    await stage.waitForTimeout(200);
+    await stage.evaluate(() => window.__demo.emit('pointer', { tool: 'spotlight', active: false }));
+    await stage.waitForTimeout(900);
+    await wiggle();
+    assert.equal(await alpha(), 0, 'no laser left at the pointer');
+    const before = await stage.evaluate(() => window.__frames);
+    for (let i = 0; i < 20; i++) { await stage.mouse.move(300 + i * 10, 250); await stage.waitForTimeout(30); }
+    const drawn = (await stage.evaluate(() => window.__frames)) - before;
+    assert.ok(drawn <= 2, `${drawn} frames drawn for an idle stage`);
+  });
+  await stage.close();
 
   // The waveform-only listening states with full motion, light and dark (screenshots for review).
   for (const scheme of ['light', 'dark']) {

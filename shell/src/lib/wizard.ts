@@ -100,3 +100,10 @@ export function hasUnsavedSecret(root: ParentNode | null | undefined): boolean {
   if (!root) return false;
   return [...root.querySelectorAll<HTMLInputElement>('.secret input')].some((input) => input.value.trim() !== '');
 }
+
+/** The test box in 试一句 (another dictation app types into it): did this round add text?
+    `before` is the box as the round began; text typed or left over from an earlier round
+    is no proof that the app typed. */
+export function typedThisRound(typed: string, before: string): boolean {
+  return typed.trim() !== '' && typed !== before;
+}

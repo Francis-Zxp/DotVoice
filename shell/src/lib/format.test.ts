@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { when } from './format';
+import { duration, when } from './format';
 
 const at = (y: number, m: number, d: number, h = 9, min = 5) => new Date(y, m - 1, d, h, min).getTime();
 
@@ -12,5 +12,20 @@ describe('when', () => {
   it('uses month and day within the year, the full date before it', () => {
     expect(when(at(2026, 10, 5, 23, 19) / 1000, now)).toBe('10月5日 23:19');
     expect(when(at(2025, 3, 1) / 1000, now)).toBe('2025年3月1日');
+  });
+});
+
+describe('duration', () => {
+  it('never shows 60 seconds after rounding', () => {
+    expect(duration(59.4)).toBe('59 秒');
+    expect(duration(59.6)).toBe('1 分 0 秒');
+    expect(duration(119.6)).toBe('2 分 0 秒');
+    expect(duration(3599.5)).toBe('1 小时 0 分');
+  });
+  it('keeps the other ranges unchanged', () => {
+    expect(duration(4.26)).toBe('4.3 秒');
+    expect(duration(75.2)).toBe('1 分 15 秒');
+    expect(duration(3725)).toBe('1 小时 2 分');
+    expect(duration(null)).toBe('—');
   });
 });

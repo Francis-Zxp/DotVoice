@@ -90,7 +90,7 @@ export function createMock() {
   let meterTimer = 0;
   let meterUntil = 0;
   const snap: Snapshot = {
-    version: '0.11.6-preview',
+    version: '0.11.8-preview',
     state: { phase: 'disconnected', message: '', armed: false },
     result: null,
     usage: {
@@ -120,9 +120,9 @@ export function createMock() {
       overlay: { enabled: true, on_switch: true, linger_seconds: 5, position: null, monitor: null, all_monitors: false, anchor: 'top-center', positions: {} },
       airmouse: { enabled: true, skip_slideshow: true }, hotkeys: { toggle_mode: '', arm_toggle: '' },
       appearance: { theme: 'system', reduced_motion: false, live_shortcut: true }, present: { tool: 'laser', hide_cursor: true, zoom: 200 },
-      voice: { whisper: 'auto' }, devices: { coexist: true }, pen: { guard_shortcuts: true },
+      voice: { whisper: 'auto', armed: false }, devices: { coexist: true }, pen: { guard_shortcuts: true },
       diagnostics: { save_audio: false },
-      general: { run_elevated: false },
+      general: { run_elevated: false, restore_armed: true },
       engine: {
         kind: 'openless',
         volc: { auth: 'key', app_id: '', resource_id: 'volc.seedasr.sauc.duration', endpoint: 'bigmodel_async' },
@@ -145,6 +145,11 @@ export function createMock() {
           airmouse_ctrl: { source: 'vendor', fire: ['68'], ignore: ['69'], gesture: 'single', label: '标注键 ⑧', default: true },
         },
         pv60: {}, tidepool: {},
+      },
+      // The slots with a shipped default, so a cleared one can be restored.
+      defaults: {
+        baseus: ['airmouse_activity', 'airmouse_ctrl', 'airmouse_wheel_down', 'airmouse_wheel_up', 'quick_note', 'right_click', 'toggle_mode'],
+        pv60: [], tidepool: [],
       },
       learning: null, warning: '',
     },
@@ -284,7 +289,13 @@ export function createMock() {
   const layout: OverlayLayout = { anchor: 'top-center', controller: params.get('mirror') !== '1', active: true, monitor: monitors[0].name };
   let overlayCache: OverlayEnvelope | null = null;
   let overlaySeq = 0;
-  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases, monitors, layout, shellEmit };
+  // QA: the capsule's click regions as reported to the shell (null = click-through), the core
+  // methods called, and a one-shot failure of the next call to a core method.
+  const hits: { rect: unknown; at: number }[] = [];
+  const calls: string[] = [];
+  const failures = new Map<string, string>();
+  const fail = (method: string, message = '预览：模拟失败') => { failures.set(method, message); };
+  (window as any).__demo = { play, speak, key, setMode, setTool, emit, state, setInstances, snap, secrets, blocked, refused, elevation, leases, monitors, layout, shellEmit, hits, calls, fail };
   const query = params.get('demo');
   const live = params.get('live');  // ?live=remote: the demo session streams accurate words
   if (query === 'input' || query === 'notes') setTimeout(() => play(query, { source: live === 'remote' || live === 'cloud' ? live : undefined }), 400);
@@ -304,6 +315,7 @@ export function createMock() {
       if (name === 'overlay_snapshot') return overlayCache;
       if (name === 'overlay_publish') { overlayCache = { seq: ++overlaySeq, model: args?.model }; return overlayCache; }
       if (name === 'overlay_action') { shellEmit('overlay://action', args?.action); return; }
+      if (name === 'overlay_interactive') { hits.push({ rect: args?.rect ?? null, at: performance.now() }); return; }
       if (name === 'overlay_monitors') return monitors.map(m => ({ ...m }));
       if (name === 'overlay_reset_position') {
         snap.prefs = { ...snap.prefs, overlay: { ...snap.prefs.overlay, position: null, positions: {} } };
@@ -320,7 +332,7 @@ export function createMock() {
         elevation.task = enabled ? 'ours' : 'missing';
         elevation.elevated = enabled;  // as after the restart
         snap.elevation = { elevated: enabled, can_elevate: elevation.available };
-        snap.prefs = { ...snap.prefs, general: { run_elevated: enabled } };
+        snap.prefs = { ...snap.prefs, general: { ...snap.prefs.general, run_elevated: enabled } };
         emit('prefs', snap.prefs);
         return { restarting: true };
       }
@@ -328,6 +340,9 @@ export function createMock() {
       return undefined;
     },
     async call(method: string, params: any): Promise<any> {
+      calls.push(method);
+      const failure = failures.get(method);
+      if (failure !== undefined) { failures.delete(method); return { error: failure }; }
       switch (method) {
         case 'check_updates': {
           const update = snap.app_update ?? { status: 'current', current_version: snap.version, latest_version: snap.version,
@@ -349,13 +364,20 @@ export function createMock() {
           if (params.action === 'arm') state('idle', '连接成功；把光标放进编辑框后使用笔上录音键');
           else if (params.action === 'disarm') state('disconnected', '已暂停，麦克风已释放');
           else if (params.action === 'stop') state('processing', '识别中');
+          if ((params.action === 'arm' || params.action === 'disarm') && snap.prefs.voice?.armed !== (params.action === 'arm')) {
+            // Like the core's _remember_armed: the user's own 启用 / 暂停 is kept in prefs voice.armed.
+            snap.prefs = { ...snap.prefs, voice: { whisper: 'auto', ...snap.prefs.voice, armed: params.action === 'arm' } };
+            emit('prefs', snap.prefs);
+          }
           return { ok: true };
         case 'set_mode': return setMode(params.value, params.source);
         case 'toggle_mode': return setMode(MODES[(MODES.indexOf(snap.destination) + 1) % MODES.length], 'ui');
         case 'set_tool': return setTool(TOOLS.includes(params.tool) ? params.tool : 'mouse');
         case 'notes': return { items: notes, tags: tagsOf(notes), warning: '' };
         case 'update_note': {
-          notes = notes.map((n) => (n.id === params.identifier ? { ...n, text: params.text, updated: now() } : n));
+          // Like the core: the text is trimmed and the title follows its first line.
+          const text = String(params.text).trim();
+          notes = notes.map((n) => (n.id === params.identifier ? { ...n, text, title: (text.split('\n')[0] || '新想法').slice(0, 48), updated: now() } : n));
           return { note: notes.find((n) => n.id === params.identifier) };
         }
         case 'set_note_tags': {
@@ -495,9 +517,9 @@ export function createMock() {
         case 'open_diagnostics': return { ok: true, path: 'C:\\Users\\预览\\AppData\\Local\\DotVoice\\runtime\\diagnostics' };
         case 'select_device': snap.selected = params.device; snap.mode = params.mode ?? 'hold'; return { ...snap };
         case 'rename_instance': {
+          // Like the core: an empty label restores the default "倍思 #n".
           const label = String(params.label ?? '').trim();
-          if (!label) return { error: '名称不能为空' };
-          return { instances: setInstances((snap.instances ?? []).map((p) => (p.id === params.id ? { ...p, label } : p))) };
+          return { instances: setInstances((snap.instances ?? []).map((p, i) => (p.id === params.id ? { ...p, label: label || `倍思 #${i + 1}` } : p))) };
         }
         case 'tidepool_action': return { status: snap.tidepool };
         case 'mark': return snap.usage;

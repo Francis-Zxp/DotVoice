@@ -54,6 +54,8 @@ export function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      // A dialog (key recording, the setup wizard) owns the keyboard until it closes.
+      if (document.querySelector('[aria-modal="true"]')) return;
       const typing = (e.target as HTMLElement)?.closest?.('input, textarea, [contenteditable="true"]');
       const index = Number(e.key) - 1;
       if (index >= 0 && index < PAGES.length && !typing) { e.preventDefault(); setPage(PAGES[index].id); }

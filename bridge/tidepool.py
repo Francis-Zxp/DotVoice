@@ -122,16 +122,24 @@ class TidepoolAdapter:
             pass
         try:
             live = self.request("GET", "/v1/status")
-            if not live.get("fresh"):
-                raise RuntimeError("Tidepool 接收器状态已过期")
-            keys = ("receiver_running", "receiver_version", "receiver_pid", "port", "enabled",
-                    "recording", "device_online", "usb_connected", "link", "battery_percent",
-                    "battery_charging", "battery_reported_at", "firmware_version", "control_supported", "cancel_pending", "cancel_error", "asr", "message")
-            result.update({key: live[key] for key in keys if key in live})
+        except RuntimeError as exc:
+            # Only a missing or incompatible API needs the receiver update; a refused or
+            # timed-out connection, or a receiver that just restarted, is temporary.
+            cause = exc.__cause__
+            legacy = isinstance(cause, (FileNotFoundError, KeyError, urllib.error.HTTPError)) or (
+                isinstance(cause, ValueError) and str(cause) in ("invalid endpoint", "unsuccessful response"))
+            result["api_upgrade_required"] = legacy
+            result["message"] = ("现有接收器需更新并启用控制 API；目前仅可查看进程，不能控制设备" if legacy
+                                 else "暂时连不上 Tidepool 接收器的控制接口，稍后自动重试")
+        else:
             result["api_upgrade_required"] = False
-            return result
-        except RuntimeError:
-            result["message"] = "现有接收器需更新并启用控制 API；目前仅可查看进程，不能控制设备"
+            if live.get("fresh"):
+                keys = ("receiver_running", "receiver_version", "receiver_pid", "port", "enabled",
+                        "recording", "device_online", "usb_connected", "link", "battery_percent",
+                        "battery_charging", "battery_reported_at", "firmware_version", "control_supported", "cancel_pending", "cancel_error", "asr", "message")
+                result.update({key: live[key] for key in keys if key in live})
+                return result
+            result["message"] = "Tidepool 接收器状态未更新，请检查设备与接收器"
         try:
             owners = self.port_probe(port)
             matches = [owner for owner in owners if matches_receiver(owner, receiver)]
@@ -193,11 +201,14 @@ class TidepoolAdapter:
         if owner is None:
             return False
         state = self.request("GET", "/v1/status")
-        self.presenter_pause = None
-        if (owner[0] is not None and owner[1] is not None and state.get("fresh")
+        if not state.get("fresh"):
+            return False  # cannot tell yet: the marker stays for the next try
+        if (owner[0] is not None and owner[1] is not None
                 and owner == (state.get("receiver_pid"), state.get("cancel_generation"))
                 and state.get("enabled") is False and state.get("cancel_pending") is False
                 and not state.get("cancel_error")):
-            self.control("resume")
+            self.control("resume", temporary=True)  # raises: the marker stays for the next try
+            self.presenter_pause = None
             return True
+        self.presenter_pause = None  # not ours any more (resumed, another session or receiver)
         return False

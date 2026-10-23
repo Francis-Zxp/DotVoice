@@ -88,7 +88,8 @@ export function useOverlayModel(applyAppearance: (prefs: Snapshot['prefs']) => v
       if (event === 'partial' && isAccurate(data.source)) seen.partial = true;
       if (event === 'mode') dispatch({ type: 'mode', value: data.value, pending: data.pending, armed: data.armed, source: data.source, tool: data.tool });
       else if (event === 'tool') dispatch({ type: 'tool', tool: data.tool });
-      else if (event === 'core_exit') dispatch({ type: 'state', phase: 'disconnected', at });
+      else if (event === 'core_exit') dispatch({ type: 'state', phase: 'disconnected', at, lost: true,
+        message: data?.restarting ? '点声核心意外退出，本段未完成，正在自动重启' : '点声核心已退出，本段未完成' });
       else if (event === 'state') dispatch({ type: 'state', phase: data.phase, armed: data.armed, message: data.message, at, destination: data.destination, whisper: typeof data.whisper === 'boolean' ? data.whisper : undefined });
       else if (event === 'drag') dispatch({ type: 'drag', locked: !!data.locked, how: data.how });
       else if (event === 'empty') dispatch({ type: 'empty' });
@@ -97,7 +98,7 @@ export function useOverlayModel(applyAppearance: (prefs: Snapshot['prefs']) => v
       else if (event === 'elevated') dispatch({ type: 'elevated' });
       else if (event === 'partial') dispatch({ type: 'partial', text: String(data.text ?? ''), source: data.source });
       else if (event === 'result') dispatch({ type: 'result', destination: data.destination, text: data.text, at: at / 1000, skipped: !!data.note_skipped,
-        empty: !!data.empty_text, noteError: !!data.note_error, envelope: data.envelope, external: data.external ? String(data.app || '对方软件') : undefined, notTyped: !!data.not_typed, copied: !!data.copied });
+        empty: !!data.empty_text, noteError: !!data.note_error, envelope: data.envelope, external: data.external ? String(data.app || '对方软件') : undefined, notTyped: data.not_typed ? String(data.not_typed) : undefined, copied: !!data.copied });
     });
     const load = async () => {
       let snapshot: Snapshot | undefined;
@@ -128,8 +129,10 @@ export function useOverlayModel(applyAppearance: (prefs: Snapshot['prefs']) => v
   const model = controller ? owned : mirrored;
   const action = useCallback((type: Action['type']) => {
     const value = type === 'pin' ? !model.pinned : undefined;
-    if (controller) dispatch(type === 'pin' ? { type, value } : { type });
-    else void shell.overlayAction({ type, value, session: model.startedAt, token: model.token });
+    // Like a mirror's: a click on a card that has meanwhile changed (or is fading out) is dropped.
+    const expected = { session: model.startedAt, token: model.token };
+    if (controller) dispatch(type === 'pin' ? { type, value, expected } : { type, expected });
+    else void shell.overlayAction({ type, value, ...expected });
   }, [controller, model.pinned, model.startedAt, model.token]);
   return { model, layout, action };
 }

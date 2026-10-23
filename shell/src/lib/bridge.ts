@@ -15,7 +15,10 @@ export class CoreError extends Error {}
 
 export async function call<T = any>(method: string, params?: Record<string, unknown>): Promise<T> {
   const value = inTauri
-    ? await invoke<T>('core_call', { method, params: params ?? null })
+    ? await invoke<T>('core_call', { method, params: params ?? null }).catch((error: unknown) => {
+      // core_call fails with a plain string (core not running, exited, timed out, method error).
+      throw error instanceof Error ? error : new CoreError(String(error));
+    })
     : await mock.call(method, params ?? {});
   if (value && typeof value === 'object' && 'error' in (value as any) && (value as any).error) {
     throw new CoreError(String((value as any).error));

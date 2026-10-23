@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { inTauri, isMock, shell } from '../lib/bridge';
 import { roster, TIDEPOOL_BATTERY_NOTE, type RosterItem } from '../lib/devices';
 import { phaseLabel } from '../lib/format';
-import { act, MODE_INFO, useStore } from '../lib/store';
+import { act, dismissReminder, MODE_INFO, useStore } from '../lib/store';
 import type { Mode } from '../lib/types';
 import { Battery, spring, Tip } from './ui';
 
@@ -46,7 +46,7 @@ export function ModeSwitch() {
         const active = mode === value;
         return (
           <button key={value} aria-pressed={active} className={`mode-${value}`} title={MODE_INFO[value].hint}
-            onClick={() => !active && act('set_mode', { value, source: 'ui' })}>
+            onClick={() => (!active || pending) && act('set_mode', { value, source: 'ui' })}>
             {active && <motion.span layoutId="mode-thumb" className="liquid absolute inset-0 rounded-full" transition={spring.snappy} />}
             <Icon size={15} className="relative" />
             <span className="relative">{MODE_INFO[value].label}</span>
@@ -207,10 +207,6 @@ export function Toasts() {
 /* OpenLess shipped (or declined) live text for remote input: say so until dismissed. */
 export function ReminderBanner() {
   const reminder = useStore((s) => s.reminder);
-  async function dismiss() {
-    await act('dismiss_reminder');
-    useStore.setState({ reminder: null });
-  }
   return (
     <AnimatePresence initial={false}>
       {reminder && (
@@ -220,7 +216,7 @@ export function ReminderBanner() {
             ? `OpenLess ${reminder.version ?? ''} 已包含实时文字支持：升级 OpenLess 后，点声录音时会显示与最终结果同一引擎的实时文字。`
             : 'OpenLess 暂未支持远程实时文字；录音时显示声线，说完后显示定稿。'}</span>
           <button className="btn btn-sm" onClick={() => act('open_url', { url: reminder.url })}>查看</button>
-          <button className="btn btn-ghost btn-sm" onClick={dismiss}>知道了</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => dismissReminder()}>知道了</button>
         </motion.div>
       )}
     </AnimatePresence>

@@ -1060,7 +1060,8 @@ class CloudBackendTests(unittest.TestCase):
         backend.feed(bytes(3200))
         backend.stop()
         events = drain(backend)
-        self.assertIn('管理员权限窗口', [e for e in events if e.get('kind') == 'notice'][0]['message'])
+        self.assertEqual(events[-1]['not_typed'], 'refused')
+        self.assertEqual([e for e in events if e.get('kind') == 'notice'], [])
         self.assertEqual(events[-1]['text'], '你好')
 
     def test_empty_transcript_is_neither_polished_nor_typed(self):

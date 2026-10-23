@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $env:PYTHONPATH = ''
-$version = '0.11.6'
+$version = '0.11.8'
 $output = Join-Path $PSScriptRoot "dist\$version"
 $distRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'dist'))
 $output = [IO.Path]::GetFullPath($output)
@@ -117,7 +117,7 @@ Move-Item -LiteralPath (Join-Path $output 'core-build\dotvoice-core') -Destinati
 $coreBuild = [IO.Path]::GetFullPath((Join-Path $output 'core-build'))
 if ([IO.Path]::GetDirectoryName($coreBuild) -ne $output) { throw 'Core build path is invalid' }
 Remove-Item -LiteralPath $coreBuild -Recurse -Force
-Copy-Item config.json,README.md,VALIDATION.md,ACCEPTANCE.md,RELEASE_0.11.6.md,LICENSE,THIRD_PARTY_PV60.md -Destination $app
+Copy-Item config.json,README.md,VALIDATION.md,ACCEPTANCE.md,RELEASE_0.11.8.md,LICENSE,THIRD_PARTY_PV60.md -Destination $app
 Copy-Item -LiteralPath licenses -Destination $app -Recurse -Force
 $integration = Join-Path $app 'integrations\tidepool'
 New-Item -ItemType Directory -Path (Join-Path $integration 'receiver') -Force | Out-Null

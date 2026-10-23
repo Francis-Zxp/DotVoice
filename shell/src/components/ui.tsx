@@ -99,6 +99,15 @@ export function Tip({ text, children, side = 'top' }: { text: ReactNode; childre
   };
   const hide = () => { window.clearTimeout(timer.current); setBox(null); };
   useEffect(() => () => window.clearTimeout(timer.current), []);
+  // The tip is placed once, from the trigger's box: scrolling or resizing closes it (a tip
+  // opened by keyboard focus would otherwise stay where the trigger was).
+  useEffect(() => {
+    if (!box) return;
+    const close = () => { window.clearTimeout(timer.current); setBox(null); };
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [box]);
   const props = children.props as Record<string, any>;
   const trigger = cloneElement(children, {
     'aria-describedby': box ? id : undefined,
@@ -140,14 +149,37 @@ export function Battery({ percent, showText = true, stale = false }: { percent: 
   );
 }
 
-/** Styled range: the filled part of the track follows the value. */
+/** Styled range: the filled part of the track follows the value. While dragged it shows its own
+    value and saves once, on release (pointer, key or focus leaving), not on every step. */
 export function Range({ value, min, max, step = 1, onChange, label, disabled, className = '' }: {
-  value: number; min: number; max: number; step?: number; onChange: (value: number) => void; label: string; disabled?: boolean; className?: string;
+  value: number; min: number; max: number; step?: number; onChange: (value: number) => unknown; label: string; disabled?: boolean; className?: string;
 }) {
-  const p = ((value - min) / (max - min)) * 100;
+  const [draft, setDraft] = useState<number | null>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const pending = useRef<number | null>(null);
+  const latest = useRef({ value, onChange });
+  latest.current = { value, onChange };
+  useEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    // The native 'change' fires once a drag ends (and per key step): the moment to save.
+    const commit = async () => {
+      const next = pending.current;
+      if (next == null) return;
+      pending.current = null;
+      try { if (next !== latest.current.value) await latest.current.onChange(next); }
+      finally { if (pending.current == null) setDraft(null); }
+    };
+    el.addEventListener('change', commit);
+    el.addEventListener('blur', commit);
+    return () => { el.removeEventListener('change', commit); el.removeEventListener('blur', commit); };
+  }, []);
+  const shown = draft ?? value;
+  const p = ((shown - min) / (max - min)) * 100;
   return (
-    <input type="range" className={`range ${className}`} min={min} max={max} step={step} value={value} aria-label={label}
-      disabled={disabled} style={{ '--p': `${p}%` } as CSSProperties} onChange={(e) => onChange(Number(e.target.value))} />
+    <input ref={input} type="range" className={`range ${className}`} min={min} max={max} step={step} value={shown} aria-label={label}
+      disabled={disabled} style={{ '--p': `${p}%` } as CSSProperties}
+      onChange={(e) => { pending.current = Number(e.target.value); setDraft(pending.current); }} />
   );
 }
 

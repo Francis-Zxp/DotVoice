@@ -54,12 +54,32 @@ const WHITE: RGB = [255, 255, 255];
    window is translucent over the desktop; its panel stands in). */
 const surfaces = (t: Record<string, string>) => [rgb(t['--panel-solid']), ...(parse(t['--window'])[1] === 1 ? [rgb(t['--window'])] : [])];
 
+const TOKENS = ['--engine-openless', '--engine-openless-text', '--engine-volc-text', '--engine-dashscope-text', '--engine-hotkey-text'];
+
 describe('engine accent tokens', () => {
   it('are defined in every theme, the OS dark palette matching [data-theme=dark]', () => {
     for (const [name, t] of Object.entries(THEMES)) {
-      for (const token of ['--engine-openless', '--engine-openless-text', '--engine-volc-text']) expect(t[token], `${name} ${token}`).toMatch(/^#/);
+      for (const token of TOKENS) expect(t[token], `${name} ${token}`).toMatch(/^#/);
     }
-    for (const token of ['--engine-openless', '--engine-openless-text', '--engine-volc-text']) expect(systemDark[token]).toBe(dark[token]);
+    for (const token of TOKENS) expect(systemDark[token]).toBe(dark[token]);
+  });
+
+  it('give the 百炼 and hotkey cards\' badge text AA and icons 3:1, on every card background', () => {
+    const cases = [['--engine-dashscope-text', ENGINE_TONE.dashscope], ['--engine-hotkey-text', '--present']] as const;
+    for (const [name, t] of Object.entries(THEMES)) {
+      for (const [token, fill] of cases) {
+        const tone = rgb(fill.startsWith('--') ? t[fill] : fill);
+        const text = rgb(t[token]);
+        for (const surface of surfaces(t)) {
+          // .engine-card: --field at rest; selected, .engine-thumb runs tone 15% → 5% over the panel.
+          const cards = [layer(t['--field'], surface), over(tone, 0.15, rgb(t['--panel-solid'])), over(tone, 0.05, rgb(t['--panel-solid']))];
+          for (const card of cards) {
+            expect(ratio(text, over(tone, 0.13, card)), `${name} ${token} badge`).toBeGreaterThanOrEqual(4.5);
+            expect(ratio(text, over(tone, 0.11, card)), `${name} ${token} icon`).toBeGreaterThanOrEqual(3);
+          }
+        }
+      }
+    }
   });
 
   it('keep the OpenLess fill dark enough for the white glyph on the current engine tile', () => {
@@ -89,5 +109,35 @@ describe('engine accent tokens', () => {
         expect(ratio(text, layer(t['--field'], strip)), `${name} hovered`).toBeGreaterThanOrEqual(4.5);
       }
     }
+  });
+});
+
+describe('text tokens', () => {
+  it('give informational faint text (.faint, --text-faint) AA on the panel and the window in every theme', () => {
+    expect(css).toMatch(/\.faint \{ color: var\(--text-faint\); \}/);
+    for (const [name, t] of Object.entries(THEMES)) {
+      for (const surface of surfaces(t)) {
+        expect(ratio(layer(t['--text-faint'], surface), surface), `${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it('keep white words on the recording stage readable in every mode (≥ 3.5:1 where the flood is lightest)', () => {
+    const flood = /\.stage-flood \{[^}]*?background: linear-gradient\(160deg, color-mix\(in srgb, var\(--mode\) (\d+)%, black\)/.exec(css);
+    expect(flood, 'the stage flood starts from the mode colour mixed with black').toBeTruthy();
+    const share = Number(flood![1]) / 100;
+    expect(/\.stage-flood \{[^}]*,\s*white\)/.test(css), 'no white-mixed highlight under the words').toBe(false);
+    for (const mode of ['--input', '--notes', '--present']) {
+      const lightest = over(rgb(light[mode]), share, [0, 0, 0]);
+      expect(ratio(WHITE, lightest), mode).toBeGreaterThanOrEqual(3.5);
+    }
+  });
+});
+
+describe('motion cost', () => {
+  it('reveals the answer per character with opacity only (no per-glyph blur; inline spans ignore transforms)', () => {
+    const frames = /@keyframes score-in \{([^}]*\})\s*\}/.exec(css);
+    expect(frames, 'score-in is defined').toBeTruthy();
+    expect(frames![1]).not.toMatch(/filter|transform/);
   });
 });

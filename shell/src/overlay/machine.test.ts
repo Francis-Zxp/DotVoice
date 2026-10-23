@@ -184,12 +184,70 @@ describe('capsule machine', () => {
     expect(m).toMatchObject({ view: 'note', text: '', startedAt: 12, whisper: false });
   });
 
-  it('a core that exits mid-session ends the card; a pinned note stays', () => {
-    // Overlay maps core_exit to a disconnected state: the restarted core never says idle.
+  it('a core that exits mid-session ends the card on a chip that says so; a pinned note stays', () => {
+    // Overlay maps core_exit to a disconnected state marked lost: the restarted core never says idle.
+    const lost: Event = { type: 'state', phase: 'disconnected', at: 2, lost: true, message: '点声核心意外退出，本段未完成，正在自动重启' };
+    for (const session of [[mode('notes')], [mode('input')]] as Event[][]) {
+      const m = run([...session, { type: 'state', phase: 'recording', at: 1 }, lost]);
+      expect(m).toMatchObject({ view: 'chip', done: true, chip: { kind: 'failed', text: '点声核心意外退出，本段未完成，正在自动重启' } });
+      expect(m.timer).toEqual({ ms: 3400, then: 'hide' });
+    }
+    // A cancel (disconnected without lost) still hides at once.
     let m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'state', phase: 'disconnected', at: 2 }]);
     expect(m.view).toBe('hidden');
-    m = run([{ type: 'state', phase: 'recording', at: 3 }, { type: 'pin' }, { type: 'state', phase: 'disconnected', at: 4 }], m);
-    expect(m).toMatchObject({ view: 'note', pinned: true });
+    m = run([{ type: 'state', phase: 'recording', at: 3 }, { type: 'pin' }, { ...lost, at: 4 }], m);
+    expect(m).toMatchObject({ view: 'note', pinned: true, done: false });
+    // Not busy: a lost core changes nothing on screen.
+    expect(run([lost]).view).toBe('hidden');
+  });
+
+  it('an unfinished pinned note that was cancelled can be unpinned and then goes', () => {
+    let m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'pin' },
+      { type: 'state', phase: 'disconnected', at: 2 }, { type: 'state', phase: 'idle', at: 3 }]);
+    expect(m).toMatchObject({ view: 'note', done: false, pinned: true, timer: null });
+    m = reduce(m, { type: 'pin', value: false });
+    expect(m).toMatchObject({ view: 'note', pinned: false, timer: { ms: 1200, then: 'hide' } });
+    expect(reduce(m, { type: 'timeout', token: m.token }).view).toBe('hidden');
+    // While the recording still runs, unpinning keeps the note.
+    m = run([{ type: 'state', phase: 'recording', at: 4 }, { type: 'pin' }, { type: 'pin' }], m);
+    expect(m).toMatchObject({ view: 'note', pinned: false, timer: null });
+  });
+
+  it('a pin belongs to its note: an input session unpins it, a following note keeps it', () => {
+    const pinned = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'pin' },
+      { type: 'result', destination: 'notes', text: '固定的便签', at: 2 }, { type: 'state', phase: 'idle', at: 3 }]);
+    expect(pinned).toMatchObject({ view: 'note', pinned: true });
+    // The next session is a note: it stays pinned (the user asked for the card to stay).
+    expect(run([{ type: 'state', phase: 'recording', at: 4 }], pinned)).toMatchObject({ view: 'note', pinned: true });
+    // An input session: the live card is never pinned, a switch shows its chip, and so does the next note.
+    let m = run([mode('input'), { type: 'state', phase: 'recording', at: 4 }], pinned);
+    expect(m).toMatchObject({ view: 'live', pinned: false });
+    m = run([{ type: 'result', destination: 'input', text: '好。', at: 5 }, mode('present')], m);
+    expect(m.chip).toMatchObject({ kind: 'mode', mode: 'present' });
+    m = run([mode('notes'), { type: 'timeout', token: m.token }, { type: 'state', phase: 'recording', at: 6 },
+      { type: 'result', destination: 'notes', text: '下一条', at: 7 }], m);
+    expect(m).toMatchObject({ view: 'note', pinned: false, timer: { ms: 5000, then: 'collapse' } });
+  });
+
+  it('closing a pinned note says the administrator-window notice it held back', () => {
+    let m = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }, { type: 'pin' },
+      { type: 'result', destination: 'notes', text: '固定的便签', at: 2 }, { type: 'elevated' }]);
+    expect(m.blockedLater).toBe(true);
+    m = reduce(m, { type: 'dismiss' });
+    expect(m).toMatchObject({ view: 'chip', chip: { kind: 'elevated' }, blockedLater: false, pinned: false, timer: { ms: 5200 } });
+    // A card dismissed mid-recording stays out of the way.
+    m = run([{ type: 'state', phase: 'idle', at: 3 }, { type: 'state', phase: 'recording', at: 4 }, { type: 'elevated' }, { type: 'dismiss' }], m);
+    expect(m.view).toBe('hidden');
+  });
+
+  it('a pin from a card fading out never pins the chip that replaced it', () => {
+    const note = run([mode('notes'), { type: 'state', phase: 'recording', at: 1 }]);
+    const expected = { session: note.startedAt, token: note.token };
+    const chip = reduce(note, { type: 'empty' });
+    expect(chip.view).toBe('chip');
+    expect(reduce(chip, { type: 'pin', value: true, expected })).toBe(chip);
+    expect(reduce(chip, { type: 'pin', value: true })).toBe(chip);
+    expect(reduce(note, { type: 'pin', value: true, expected }).pinned).toBe(true);
   });
 
   it('a wizard test and a failed recording each end on their own chip, never silently', () => {
@@ -425,15 +483,18 @@ describe('capsule machine', () => {
 
   it('text an administrator window refused never reads as typed', () => {
     let m = run([{ type: 'state', phase: 'recording', at: 1 }, { type: 'state', phase: 'processing', at: 2 },
-      { type: 'result', destination: 'input', text: '我要评论', at: 3, notTyped: true, copied: true }]);
+      { type: 'result', destination: 'input', text: '我要评论', at: 3, notTyped: 'elevated', copied: true }]);
     expect(m.view).toBe('chip');
-    expect(m.chip).toMatchObject({ kind: 'kept', text: 'copied' });
+    expect(m.chip).toMatchObject({ kind: 'kept', text: 'copied:elevated' });
     expect(m.text).toBe('我要评论');
     expect(m.timer).toEqual({ ms: 6000, then: 'hide' });
-    m = run([{ type: 'result', destination: 'input', text: '我要评论', at: 4, notTyped: true, copied: false }]);
-    expect(m.chip).toMatchObject({ kind: 'kept', text: '' });
+    m = run([{ type: 'result', destination: 'input', text: '我要评论', at: 4, notTyped: 'elevated', copied: false }]);
+    expect(m.chip).toMatchObject({ kind: 'kept', text: ':elevated' });
+    // A lock screen / UAC prompt refused the keystrokes: the reason travels with the chip.
+    m = run([{ type: 'result', destination: 'input', text: '我要评论', at: 4, notTyped: 'refused', copied: true }]);
+    expect(m.chip).toMatchObject({ kind: 'kept', text: 'copied:refused' });
     // A note is saved, not typed: never 'kept'.
-    m = run([{ type: 'result', destination: 'notes', text: '记一下', at: 5, notTyped: true }]);
+    m = run([{ type: 'result', destination: 'notes', text: '记一下', at: 5, notTyped: 'elevated' }]);
     expect(m.chip?.kind).toBe('saved');
   });
 

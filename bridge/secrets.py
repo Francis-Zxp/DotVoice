@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 FILE_NAME = 'secrets.json'
@@ -27,6 +28,7 @@ MASK = '••••'
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}')
 _ENTROPY = b'DotVoice secret v1\x00'
 MAX_VALUE = 4096
+READ_RETRY = .25   # another program (antivirus, backup) briefly holding the file
 
 
 class _Blob(ctypes.Structure):
@@ -120,13 +122,24 @@ class SecretStore:
     def _entropy(name):
         return _ENTROPY + name.encode('utf-8')   # a value only decrypts under its own name
 
-    def _read(self):
-        try:
-            data = json.loads(self.path.read_text(encoding='utf-8'))
-        except FileNotFoundError:
-            return {}
-        except (OSError, ValueError):
-            return {}
+    def _read(self, strict=False):
+        """{} when the file is missing or damaged. When it cannot be read (antivirus or backup
+        holding it): {} for a lookup; strict (before a write) retries once, then raises, so a
+        save never overwrites the keys it could not read."""
+        for attempt in (0, 1):
+            try:
+                data = json.loads(self.path.read_text(encoding='utf-8'))
+                break
+            except FileNotFoundError:
+                return {}
+            except ValueError:   # damaged: it decrypts nothing, a save may start over
+                return {}
+            except OSError:
+                if not strict:
+                    return {}
+                if attempt:
+                    raise
+                time.sleep(READ_RETRY)
         items = data.get('items') if isinstance(data, dict) else None
         return {k: v for k, v in items.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(items, dict) else {}
 
@@ -151,7 +164,7 @@ class SecretStore:
             raise ValueError('密钥格式无效（过长或含控制字符）')
         blob = protect(value.encode('utf-8'), self._entropy(name))
         with self.lock:
-            items = self._read()
+            items = self._read(strict=True)
             items[name] = base64.b64encode(blob).decode('ascii')
             self._write(items)
 
@@ -170,7 +183,7 @@ class SecretStore:
     def delete(self, name):
         _check_name(name)
         with self.lock:
-            items = self._read()
+            items = self._read(strict=True)
             if items.pop(name, None) is not None:
                 self._write(items)
 

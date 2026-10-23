@@ -20,7 +20,9 @@ def clean_note(text):
     # '可能', negation, repetitions, scientific numbers or technical tokens.
     text = re.sub(r'(^|[，,。！？!?；;\n]\s*)[嗯呃额]+(?:[，,、]\s*|(?=[。！？!?；;\n]|$))', r'\1', text.strip())
     text = re.sub(r'^[，,、。\s]+', '', text)
-    text = re.sub(r'([。！？!?])\s*(?=\S)', r'\1\n', text)
+    # Break after a run of end marks plus any closing quotes / brackets ("？！", "。）"). The
+    # lookahead never takes a mark or closer itself, so the end of the text cannot split the run.
+    text = re.sub(r'([。！？!?]+[”’」』）)\]]*)\s*(?=[^\s。！？!?”’」』）)\]])', r'\1\n', text)
     return '\n'.join(line.strip() for line in text.splitlines() if line.strip())
 
 
@@ -44,9 +46,13 @@ def clean_tags(tags):
 
 
 def _normalize(note):
-    if not isinstance(note.get('tags'), list):
+    tags = note.get('tags')
+    if not isinstance(tags, list):
         legacy = LEGACY_TAGS.get(note.get('category'))
         note['tags'] = [legacy] if legacy else []
+    else:
+        # A hand-edited file: a non-text tag must not break the whole list (set / sort).
+        note['tags'] = [tag for tag in tags if isinstance(tag, str)]
     return note
 
 
@@ -75,7 +81,7 @@ class NoteStore:
     def add(self, text, tags=None, duration=None):
         if not isinstance(text, str) or not text.strip():
             return None
-        polished = clean_note(text)
+        polished = clean_note(text) or text.strip()  # never a note with empty text
         note = {'id': uuid.uuid4().hex, 'created': time.time(), 'tags': clean_tags(tags or []),
                 'title': _title(polished), 'source': text, 'text': polished,
                 'cleanup': '沿用 OpenLess 当前配置；本地去除独立语气词并分段'}
@@ -107,6 +113,7 @@ class NoteStore:
         with self.lock:
             note = self._load(identifier)
             note['text'] = text.strip()
+            note['title'] = _title(note['text'])  # a corrected first line shows in the list too
             note['updated'] = time.time()
             return self._save(note)
 

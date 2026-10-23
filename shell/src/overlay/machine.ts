@@ -5,7 +5,9 @@ import type { LiveSource, Mode, Phase, Snapshot, Tool } from '../lib/types';
 
 export type View = 'hidden' | 'chip' | 'live' | 'note';
 /* elevated: an administrator window dropped a click / scroll (said once per window);
-   kept: it dropped the typed text, which is kept (chip text 'copied' = on the clipboard).
+   kept: the typed text did not arrive and is kept (chip text '<copied|>:<reason>': 'copied' =
+   on the clipboard; reason 'elevated' = an administrator window, 'partial' / 'refused' = Windows
+   refused the keystrokes).
    test: a setup-wizard test recording ended - nothing was typed, the wizard shows the text.
    failed: a built-in engine could not finish this one recording (chip text = why); the pen
    stays ready, so this is no connection error.
@@ -47,14 +49,15 @@ export type Event =
       seen: { mode: boolean; state: boolean; tool: boolean; partial: boolean }; at: number }
   | { type: 'mode'; value: Mode; pending: Mode | null; armed: boolean; source: string; tool?: Tool }
   | { type: 'tool'; tool: Tool }
-  | { type: 'state'; phase: Phase; armed?: boolean; message?: string; at: number; destination?: 'input' | 'notes'; whisper?: boolean }
+  /* lost: the core exited unexpectedly (core_exit), not a cancel: an unfinished card says so. */
+  | { type: 'state'; phase: Phase; armed?: boolean; message?: string; at: number; destination?: 'input' | 'notes'; whisper?: boolean; lost?: boolean }
   | { type: 'drag'; locked: boolean; how?: 'grab' | 'lock' }
   | { type: 'empty' }
   | { type: 'test' }
   | { type: 'failed'; message: string }
   | { type: 'elevated' }
   | { type: 'partial'; text: string; source?: string }
-  | { type: 'result'; destination: Mode; text: string; at: number; skipped?: boolean; empty?: boolean; noteError?: boolean; envelope?: number[]; external?: string; notTyped?: boolean; copied?: boolean }
+  | { type: 'result'; destination: Mode; text: string; at: number; skipped?: boolean; empty?: boolean; noteError?: boolean; envelope?: number[]; external?: string; notTyped?: string; copied?: boolean }
   | { type: 'timeout'; token: number }
   | { type: 'pin'; value?: boolean; expected?: { session: number | null; token: number } }
   | { type: 'dismiss'; expected?: { session: number | null; token: number } };
@@ -90,8 +93,9 @@ function still(model: Model): Model {
   return { ...model, timer: null, token: model.token + 1 };
 }
 
+// Pinning belongs to the card on screen: a hidden card is no longer pinned.
 function hide(model: Model): Model {
-  return { ...still(model), view: 'hidden', chip: null, blockedLater: false };
+  return { ...still(model), view: 'hidden', chip: null, blockedLater: false, pinned: false };
 }
 
 function chip(model: Model, kind: ChipKind, mode: Mode, pending = false, text = '', ms = 1700): Model {
@@ -144,7 +148,8 @@ export function reduce(model: Model, event: Event): Model {
         // boosting began) is the same session, also when its card was dismissed.
         const fresh = !isBusy(model.phase) || model.done;
         const sessionMode = fresh ? sessionLook(event.destination, model.mode) : model.sessionMode;
-        if (fresh) next = { ...next, text: '', source: null, final: false, done: false, savedAt: null, sessionMode, startedAt: null, whisper: false, envelope: undefined, external: undefined };
+        // A pinned note carries over to the next note only; an input or present session unpins it.
+        if (fresh) next = { ...next, text: '', source: null, final: false, done: false, savedAt: null, sessionMode, startedAt: null, whisper: false, envelope: undefined, external: undefined, pinned: sessionMode === 'notes' && model.pinned };
         // Whisper is a property of the session: a later event may confirm it; an omitted flag keeps it.
         next = { ...next, whisper: event.whisper ?? next.whisper };
         if (!fresh && model.view === 'hidden') return still(next);  // dismissed: stays out of the way
@@ -161,6 +166,10 @@ export function reduce(model: Model, event: Event): Model {
       }
       // idle / disconnected
       if (model.pinned && model.view === 'note') return next;
+      // The core died mid-session: never a silent end (a cancel still hides at once).
+      if (event.lost && (model.view === 'note' || model.view === 'live') && !model.done) {
+        return chip({ ...next, done: true, pinned: false }, 'failed', model.mode, false, event.message || '点声核心意外退出，本段未完成', 3400);
+      }
       if ((model.view === 'note' || model.view === 'live') && !model.done) {
         return phase === 'disconnected' ? hide(next) : arm(next, 1200, 'hide');
       }
@@ -215,7 +224,8 @@ export function reduce(model: Model, event: Event): Model {
       const next = { ...model, done: true, text: event.text, final: true, savedAt: event.at, envelope: event.envelope?.slice(0, 600), external: event.external };
       if (event.notTyped && event.destination !== 'notes') {
         // Never "已输入到光标处": the text did not arrive. It is kept (clipboard, main window).
-        return chip({ ...next, blockedLater: false }, 'kept', model.mode, false, event.copied ? 'copied' : '', 6000);
+        // Chip text '<copied|>:<reason>' (reason: the result's not_typed, e.g. 'elevated').
+        return chip({ ...next, blockedLater: false }, 'kept', model.mode, false, (event.copied ? 'copied' : '') + ':' + event.notTyped, 6000);
       }
       if (event.destination === 'notes') {
         if (model.view !== 'note') return chip(next, 'saved', 'notes', false, '', 1600);
@@ -231,12 +241,17 @@ export function reduce(model: Model, event: Event): Model {
       return hide(model);
     }
     case 'pin': {
+      // Only the note card has a pin (a stale button of a card fading out has none).
+      if (model.view !== 'note') return model;
       const pinned = event.value ?? !model.pinned;
       if (pinned === model.pinned) return model;
       const next = { ...model, pinned };
-      return pinned ? still(next) : model.done ? arm(next, model.linger * 1000, 'collapse') : next;
+      // Unpinned: a saved note collapses, a session still running stays, an interrupted one goes.
+      return pinned ? still(next) : model.done ? arm(next, model.linger * 1000, 'collapse') : isBusy(model.phase) ? next : arm(next, 1200, 'hide');
     }
     case 'dismiss':
+      // An administrator-window notice held back for the card is said now (once per window).
+      if (model.done && model.blockedLater) return chip({ ...model, pinned: false, blockedLater: false }, 'elevated', model.mode, false, '', 5200);
       return hide({ ...model, pinned: false });
   }
 }

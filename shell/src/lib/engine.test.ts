@@ -29,14 +29,17 @@ describe('engine catalogue', () => {
     expect(Object.values(ENGINE_TONE)).not.toContain('var(--brand)');
   });
 
-  it('pairs each fill with a text shade: Doubao and OpenLess follow their theme text tokens', () => {
+  it('pairs each fill with a text shade: every engine follows its theme text token', () => {
     expect(Object.keys(ENGINE_TONE_TEXT).sort()).toEqual(['dashscope', 'hotkey', 'openless', 'volc']);
     expect(ENGINE_TONE_TEXT.volc).toBe('var(--engine-volc-text, #2850c8)');
     expect(ENGINE_TONE_TEXT.openless).toBe('var(--engine-openless-text, #7c3aed)');
-    // The fill never doubles as the text token (dark: white glyph on pale lavender).
+    expect(ENGINE_TONE_TEXT.dashscope).toBe('var(--engine-dashscope-text, #9c3d00)');
+    expect(ENGINE_TONE_TEXT.hotkey).toBe('var(--engine-hotkey-text, #066258)');
+    // The fill never doubles as the text token (light: an orange or teal badge at 2–2.6:1).
+    for (const kind of ['volc', 'dashscope', 'openless', 'hotkey'] as const) expect(ENGINE_TONE_TEXT[kind]).not.toBe(ENGINE_TONE[kind]);
     expect(ENGINE_TONE.openless).not.toContain('-text');
     expect(engineToneVars('openless')).toEqual({ '--tone': ENGINE_TONE.openless, '--tone-text': ENGINE_TONE_TEXT.openless });
-    expect(engineToneVars('dashscope')).toEqual({ '--tone': '#f2711c', '--tone-text': '#f2711c' });
+    expect(engineToneVars('dashscope')).toEqual({ '--tone': '#f2711c', '--tone-text': 'var(--engine-dashscope-text, #9c3d00)' });
   });
 });
 

@@ -1,5 +1,5 @@
 import { motion } from 'motion/react';
-import { BatteryCharging, Gauge, History } from 'lucide-react';
+import { AlertTriangle, BatteryCharging, Gauge, History } from 'lucide-react';
 import { useId, useState } from 'react';
 import { Battery, Glass, PageHeader, SectionTitle, spring } from '../components/ui';
 import { batteryTone } from '../lib/devices';
@@ -121,6 +121,16 @@ export function BatteryPage() {
   return (
     <div>
       <PageHeader eyebrow={device?.name ?? ''} title="续航" />
+      {/* usage.json / instances.json could not be read or saved (core usage_view): said here,
+          not only in a file the user never opens. Same banner as the settings warnings. */}
+      {usage.warning ? (
+        <div className="mb-6 grid gap-2" data-usage-warning>
+          <div className="banner" role="status">
+            <span className="banner-ico" data-tone="bad"><AlertTriangle size={15} /></span>
+            <span className="flex-1">{usage.warning}</span>
+          </div>
+        </div>
+      ) : null}
       <PenBatteries />
       <SectionTitle icon={<Gauge size={15} />} title="本轮续航" hint="最近一次上报与满电以来的使用" />
       <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))' }}>
@@ -146,8 +156,9 @@ export function BatteryPage() {
           <div className="relative z-[1] mt-4 grid grid-cols-3 gap-2">
             {[
               ['满电后经过', active ? duration(usage.now - active.started) : '—', '从首次观察到 100%'],
-              ['说话时长', duration(t.speech_seconds ?? 0), '本地语音检测 · 估计'],
-              ['累计录音', duration(t.audio_seconds ?? 0), `${t.sessions ?? 0} 次完成转写`],
+              // No cycle running: the numbers are the totals across cycles, and say so.
+              [active ? '说话时长' : '说话时长（累计）', duration(t.speech_seconds ?? 0), '本地语音检测 · 估计'],
+              [active ? '累计录音' : '录音（累计）', duration(t.audio_seconds ?? 0), `${t.sessions ?? 0} 次完成转写`],
             ].map(([label, value, hint]) => (
               <div key={label} className="glass-flat min-w-0 px-3.5 py-3">
                 <div className="faint text-[11.5px]">{label}</div>

@@ -34,6 +34,14 @@ describe('兼容管理员权限窗口', () => {
     expect(blockedChip('elevated')).toEqual({ title: '该窗口以管理员权限运行', hint: '系统拦截了点声的模拟点击/输入', detail: `可在 ${ELEVATION_SETTING} 开启` });
     expect(blockedChip('kept', true).hint).toBe('已复制到剪贴板，按 Ctrl+V 粘贴');
     expect(blockedChip('kept', false).hint).toContain('主窗口');
+    expect(blockedChip('kept', true, 'elevated')).toEqual(blockedChip('kept', true));
+    // A lock screen / UAC prompt refused the keystrokes: never blame an administrator window.
+    for (const reason of ['refused', 'partial']) {
+      const refused = blockedChip('kept', true, reason);
+      expect(refused.title).toBe('文字没能输入');
+      expect(refused.hint).toBe('已复制到剪贴板，按 Ctrl+V 粘贴');
+      expect(refused.detail).not.toContain(ELEVATION_SETTING);
+    }
     expect(keptToast({ not_typed_message: '核心的原话' })).toBe('核心的原话');
     expect(keptToast({ copied: true })).toContain('已复制到剪贴板');
     expect(keptToast({ copied: false })).toContain(ELEVATION_SETTING);

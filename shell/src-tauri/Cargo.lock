@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "dotvoice"
-version = "0.11.6"
+version = "0.11.8"
 dependencies = [
  "serde",
  "serde_json",

@@ -300,12 +300,18 @@ class StreamSession:
                 packet = self.packet
                 per_message = max(1, MAX_CHUNK // packet) * packet
                 while len(pending) >= packet:
+                    if self.ended.is_set() or self.overflow:
+                        break   # cancelled (or doomed): the rest of a backlog is not uploaded
                     size = min(len(pending) // packet * packet, per_message)
                     self._send(ws, bytes(pending[:size]))
                     del pending[:size]
-                if finishing and not self.ended.is_set():
+                    with self.lock:
+                        self.backlog -= size
+                if finishing and not self.ended.is_set() and not self.overflow:
                     # The rest goes at once, however short: release-to-final latency never
                     # waits for a packet to fill up.
+                    with self.lock:
+                        self.backlog -= len(pending)
                     self._finish(ws, bytes(pending))
                     pending.clear()
             if self._readable(ws, 0.01):
@@ -378,6 +384,8 @@ class StreamSession:
         if self.replay is None or self.retries >= self.retry_limit or self.ended.is_set():
             raise EngineError(retry.message) from None
         self.retries += 1
+        with self.lock:
+            self.backlog += len(self.replay)   # unsent again: counted until it goes out a second time
         pending[:0] = self.replay
         self.replay = None
         self.finish_sent = False
@@ -386,7 +394,8 @@ class StreamSession:
         return self._connect()
 
     def _take(self, pending):
-        """Move queued audio into `pending`; True once finish() was seen."""
+        """Move queued audio into `pending`; True once finish() was seen. Audio in `pending`
+        still counts as backlog until it is sent."""
         finishing = False
         while True:
             try:
@@ -398,9 +407,10 @@ class StreamSession:
             if item is _FINISH:
                 finishing = True
                 continue
-            with self.lock:
-                self.backlog -= len(item)
-            if not finishing:
+            if finishing:   # fed after finish(): dropped
+                with self.lock:
+                    self.backlog -= len(item)
+            else:
                 pending += item
 
     @staticmethod
@@ -500,34 +510,44 @@ def run_wav(client, path, realtime=True, chunk_ms=100, out=None):
     session = client.session(events.put)
     chunk = BYTES_PER_SECOND * chunk_ms // 1000
     began = time.monotonic()
+    stopped = None
+
+    def outcome(event):
+        """0 for the final text, 2 for an error (a session delivers one of them once), else None."""
+        _show(event, began, out)
+        if event.get('type') == 'final':
+            after = f'（松开后 {time.monotonic() - stopped:.2f} 秒）' if stopped is not None else ''
+            out.write(f'\n最终结果{after}：{event["text"]}\n')
+            return 0
+        if event.get('kind') == 'error':
+            out.write('\n')
+            return 2
+        return None
+
     session.start()
+    result = None
     for start in range(0, len(pcm), chunk):
         session.feed(pcm[start:start + chunk])
         if realtime:
             time.sleep(chunk_ms / 1000)
-        while not events.empty():
-            _show(events.get(), began, out)
-    stopped = time.monotonic()
-    session.finish()
-    result = 1
-    deadline = stopped + session.final_timeout + 10
-    while time.monotonic() < deadline:
-        try:
-            event = events.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        _show(event, began, out)
-        if event.get('type') == 'final':
-            out.write(f'\n最终结果（松开后 {time.monotonic() - stopped:.2f} 秒）：{event["text"]}\n')
-            result = 0
-            break
-        if event.get('kind') == 'error':
-            out.write('\n')
-            result = 2
-            break
-    else:
+        while result is None and not events.empty():
+            result = outcome(events.get())
+        if result is not None:
+            break   # e.g. a refused key: no point feeding the rest
+    if result is None:
+        stopped = time.monotonic()
+        session.finish()
+        deadline = stopped + session.final_timeout + 10
+        while result is None and time.monotonic() < deadline:
+            try:
+                event = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            result = outcome(event)
+    if result is None:
         out.write('\n等待结果超时\n')
         session.cancel()
+        result = 1
     stats = session.stats
     if stats.get('connected') and session.started_at:
         out.write(f'连接耗时 {stats["connected"] - session.started_at:.2f} 秒')

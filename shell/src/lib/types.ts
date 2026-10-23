@@ -149,8 +149,9 @@ export interface Prefs {
   hotkeys: { toggle_mode: string; arm_toggle: string };
   appearance: { theme: 'system' | 'light' | 'dark' | 'glass'; reduced_motion: boolean; live_shortcut?: boolean };
   present: { tool: Tool; hide_cursor: boolean; zoom?: number };
-  /** Optional so an older core without these keys still renders (defaults shown). */
-  voice?: { whisper: WhisperMode };
+  /** Optional so an older core without these keys still renders (defaults shown).
+      armed: the user's last 启用 / 暂停, written only by the core (never sent from the UI). */
+  voice?: { whisper: WhisperMode; armed?: boolean };
   devices?: { coexist: boolean };
   pen?: { guard_shortcuts: boolean };
   /** save_audio: keep the last 3 recordings (raw + as sent) locally for tuning 气声; 24 h. */
@@ -160,8 +161,10 @@ export interface Prefs {
   /** done: the first-run wizard finished or was skipped. */
   setup?: { done: boolean };
   /** run_elevated (兼容管理员权限窗口): mirrors the shell's logon task; changed only through
-      shell.elevationSet (UAC + restart). Absent in an older core. */
-  general?: { run_elevated: boolean };
+      shell.elevationSet (UAC + restart). Absent in an older core.
+      restore_armed: at launch, voice is enabled again if it was when DotVoice last ran
+      (absent = on). */
+  general?: { run_elevated: boolean; restore_armed?: boolean };
 }
 
 /** The shell's elevation_status: DotVoice as administrator (兼容管理员权限窗口). */
@@ -203,6 +206,8 @@ export interface Learning {
 
 export interface Bindings {
   devices: Record<string, Record<string, Binding>>;
+  /** Per device, the slots with a shipped default (absent in an older core). */
+  defaults?: Record<string, string[]>;
   learning: Learning | null;
   warning: string;
 }
@@ -274,8 +279,9 @@ export interface Result {
   /** The hotkey bridge: another app typed the words (text is empty). */
   external?: boolean;
   app?: string;
-  /** An administrator window dropped the typed text: it is kept (and, copied, on the clipboard). */
-  not_typed?: 'elevated';
+  /** The typed text did not arrive: an administrator window dropped it ('elevated'), or Windows
+      refused some ('partial') or all ('refused') keystrokes. It is kept (and, copied, on the clipboard). */
+  not_typed?: 'elevated' | 'partial' | 'refused';
   copied?: boolean;
   not_typed_message?: string;
 }

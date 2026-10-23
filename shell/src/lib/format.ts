@@ -51,9 +51,11 @@ export function fullDate(seconds: number) {
 export function duration(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return '—';
   const s = Math.max(0, seconds);
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} 秒`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m} 分 ${Math.round(s % 60)} 秒`;
+  if (s < 59.5) return `${s.toFixed(s < 10 ? 1 : 0)} 秒`;
+  // Round the total first, so 119.6 s reads 2 分 0 秒 rather than 1 分 60 秒.
+  const t = Math.round(s);
+  const m = Math.floor(t / 60);
+  if (m < 60) return `${m} 分 ${t % 60} 秒`;
   return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
 }
 

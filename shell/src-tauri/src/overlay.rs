@@ -72,12 +72,15 @@ impl Settings {
         }
     }
 }
-struct Drag { monitor: String, position: (i32, i32), generation: u64 }
+/// `cursor`: where the drag ended, on the card itself (the host's corner can lie off-screen).
+struct Drag { monitor: String, position: (i32, i32), cursor: Option<(i32, i32)>, generation: u64 }
 #[derive(Default)]
 struct PlacementState {
     settings: Settings, initialized: bool, pending: bool, generation: u64,
     dragging: BTreeSet<String>, completed: Vec<Drag>,
     save_pending: Option<(Settings, u64)>, save_inflight: Option<(Settings, u64)>, save_running: bool,
+    /// The core's settings as last confirmed (a snapshot, or a save it acknowledged).
+    confirmed: Option<Settings>,
 }
 impl PlacementState {
     fn reset_drags(&mut self) {
@@ -85,22 +88,37 @@ impl PlacementState {
         self.completed.clear();
         self.pending = true;
     }
+    /// 恢复预设位置 is a local decision: it wins over any older snapshot and is saved next.
+    fn reset_placement(&mut self) {
+        self.settings.positions.clear();
+        self.settings.legacy = None;
+        self.save_pending = None;
+        self.reset_drags();
+    }
     fn update(&mut self, mut settings: Settings) -> bool {
         if self.save_inflight.as_ref().is_some_and(|(sent, _)| &settings == sent) {
+            self.confirmed = Some(settings);
             return false; // A delayed complete snapshot also contains stale anchor/enabled fields.
         }
         // The core echoes each save before replying. An older in-flight save must not
         // overwrite a newer local drag/reset; unrelated settings in that echo still apply.
-        if self.save_inflight.as_ref().is_some_and(|(sent, _)| settings.monitor == sent.monitor
-            && settings.positions == sent.positions && settings.legacy.is_none()) {
+        let echo = self.save_inflight.as_ref().is_some_and(|(sent, _)| settings.monitor == sent.monitor
+            && settings.positions == sent.positions && settings.legacy.is_none());
+        // Another prefs_set (theme, zoom step) that committed just before the in-flight save
+        // emits what the core had before it: not a decision, so the drag stays and stays queued.
+        let stale = self.save_inflight.is_some() && self.confirmed.as_ref() == Some(&settings);
+        if !stale { self.confirmed = Some(settings.clone()); }
+        if echo || stale {
             settings.monitor = self.settings.monitor.clone();
             settings.positions = self.settings.positions.clone();
             settings.legacy = self.settings.legacy;
         }
         if self.initialized && self.settings == settings { return false }
         self.settings = settings; self.initialized = true; self.pending = true;
-        self.save_pending = None;
-        self.reset_drags();
+        if !stale {
+            self.save_pending = None;
+            self.reset_drags();
+        }
         true
     }
     fn finish_drags(&mut self, screens: &[Display]) -> bool {
@@ -125,6 +143,11 @@ impl PlacementState {
     }
     fn saved(&mut self, sent: &Settings, generation: u64, ok: bool) {
         self.save_inflight = None;
+        if let Some(confirmed) = self.confirmed.as_mut().filter(|_| ok) {
+            confirmed.monitor = sent.monitor.clone();
+            confirmed.positions = sent.positions.clone();
+            confirmed.legacy = None;
+        }
         if ok && self.save_pending.is_none() && (self.generation != generation
             || self.settings.monitor != sent.monitor || self.settings.positions != sent.positions) {
             // If Reset won while the request was already in flight, persist that newer
@@ -160,6 +183,10 @@ impl Screen {
     fn contains_saved(self, x: i32, y: i32) -> bool {
         let cx = x as i64 + self.size().width as i64 / 2;
         cx >= self.x as i64 && cx < self.x as i64 + self.width as i64
+            && y as i64 >= self.y as i64 && (y as i64) < self.y as i64 + self.height as i64
+    }
+    fn contains(self, (x, y): (i32, i32)) -> bool {
+        x as i64 >= self.x as i64 && (x as i64) < self.x as i64 + self.width as i64
             && y as i64 >= self.y as i64 && (y as i64) < self.y as i64 + self.height as i64
     }
     fn position(self, saved: Option<(i32, i32)>, anchor: &str) -> (i32, i32) {
@@ -221,12 +248,17 @@ fn targets(displays: &[Display], settings: &Settings) -> Vec<Target> {
 fn apply_drag(settings: &mut Settings, screens: &[Display], drag: Drag) {
     let owner = screens.iter().find(|d| d.name == drag.monitor);
     let destination = if settings.all_monitors { owner } else {
-        screens.iter().find(|d| d.screen.contains_saved(drag.position.0, drag.position.1)).or(owner)
+        drag.cursor.and_then(|p| screens.iter().find(|d| d.screen.contains(p)))
+            .or_else(|| screens.iter().find(|d| d.screen.contains_saved(drag.position.0, drag.position.1))).or(owner)
     };
     if let Some(destination) = destination {
         settings.positions.insert(destination.name.clone(), destination.screen.position(Some(drag.position), &settings.anchor));
         settings.legacy = None;
-        if !settings.all_monitors { settings.monitor = Some(destination.name.clone()); }
+        // "Follow the primary screen" survives a drag there; targets() would show it there anyway.
+        let first = screens.iter().find(|d| d.primary).or(screens.first());
+        if !settings.all_monitors && (settings.monitor.is_some() || first.map(|d| &d.name) != Some(&destination.name)) {
+            settings.monitor = Some(destination.name.clone());
+        }
     }
 }
 
@@ -292,7 +324,7 @@ pub fn apply_prefs(app: &AppHandle, prefs: &Value) {
 
 pub fn reset_placement(app: &AppHandle) {
     let state = app.state::<OverlayState>();
-    state.placement.lock().unwrap().reset_drags();
+    state.placement.lock().unwrap().reset_placement();
     state.reposition.notify_all();
 }
 
@@ -415,10 +447,14 @@ unsafe extern "system" fn placement_proc(hwnd: HWND, message: u32, wparam: WPARA
             let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             let got = GetWindowRect(hwnd, &mut rect) != 0;
             let position = (rect.left, rect.top);
+            // A real drag ends with the cursor over the host (a synthetic one may not).
+            let mut pt = POINT { x: 0, y: 0 };
+            let cursor = (message == WM_EXITSIZEMOVE && got && GetCursorPos(&mut pt) != 0
+                && pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom).then_some((pt.x, pt.y));
             if let Some(w) = state.windows.lock().unwrap().get_mut(&context.label) {
                 if message == WM_ENTERSIZEMOVE { w.drag_origin = got.then_some((position, generation)); }
                 else if let Some((_, started)) = w.drag_origin.take().filter(|(origin, _)| got && *origin != position) {
-                    if let Some(name) = w.layout.monitor.clone() { completed = Some(Drag { monitor: name, position, generation: started }); }
+                    if let Some(name) = w.layout.monitor.clone() { completed = Some(Drag { monitor: name, position, cursor, generation: started }); }
                 }
             }
         }
@@ -597,7 +633,7 @@ mod tests {
     fn dragging_one_screen_preserves_other_screen_positions() {
         let mut settings = Settings { all_monitors: true, ..Settings::default() };
         settings.positions.insert("main".into(), (100, 80));
-        apply_drag(&mut settings, &displays(), Drag { monitor: "laptop".into(), position: (3900, 300), generation: 0 });
+        apply_drag(&mut settings, &displays(), Drag { monitor: "laptop".into(), position: (3900, 300), cursor: None, generation: 0 });
         let shown = targets(&displays(), &settings);
         assert_eq!(shown[0].saved, Some((100, 80))); assert_eq!(shown[1].saved, Some((3900, 300)));
         assert_eq!(shown[2].saved, None);
@@ -605,13 +641,51 @@ mod tests {
     #[test]
     fn single_drag_can_change_monitor_but_all_mode_stays_on_its_own_screen() {
         let mut settings = Settings::default();
-        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (3900, 300), generation: 0 });
+        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (3900, 300), cursor: None, generation: 0 });
         assert_eq!(settings.monitor.as_deref(), Some("laptop"));
         assert_eq!(targets(&displays(), &settings)[0].saved, Some((3900, 300)));
         settings.all_monitors = true;
-        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (3900, 300), generation: 0 });
+        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (3900, 300), cursor: None, generation: 0 });
         assert_eq!(settings.positions["main"], (3090, 300));
         assert_eq!(settings.positions["laptop"], (3900, 300));
+    }
+    #[test]
+    fn the_card_under_the_cursor_picks_the_screen_not_the_hosts_corner() {
+        // The host's top edge lies above the staggered laptop (or off-screen); the card, and
+        // the cursor on it, are on the laptop.
+        for (anchor, position, cursor) in [("top-center", (4000, 229), (4375, 265)),
+            ("center", (3940, -135), (4315, 300)), ("bottom-center", (3940, -65), (4315, 740))] {
+            let mut settings = Settings { anchor: anchor.into(), ..Settings::default() };
+            apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position, cursor: Some(cursor), generation: 0 });
+            assert_eq!(settings.monitor.as_deref(), Some("laptop"), "{anchor}");
+            assert_eq!(settings.positions["laptop"], (position.0, 247), "{anchor}: clamped to the laptop's work area");
+            assert!(!settings.positions.contains_key("main"), "{anchor}");
+        }
+        // The host's corner is on the laptop, the card under the cursor still on main.
+        let mut settings = Settings::default();
+        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (3500, 300), cursor: Some((3700, 330)), generation: 0 });
+        assert_eq!(settings.positions["main"], (3090, 300));
+        assert!(!settings.positions.contains_key("laptop"));
+    }
+    #[test]
+    fn a_drag_on_the_primary_screen_keeps_following_the_primary_screen() {
+        let mut settings = Settings::default();
+        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (100, 80), cursor: Some((475, 110)), generation: 0 });
+        assert_eq!(settings.monitor, None);
+        assert_eq!(targets(&displays(), &settings)[0].saved, Some((100, 80)));
+        let mut swapped = displays();
+        swapped[0].primary = false;
+        swapped[1].primary = true;
+        assert_eq!(targets(&swapped, &settings)[0].monitor, "laptop", "follows a new primary screen");
+        // A legacy position on another screen is pinned there, or the capsule would jump to main.
+        let mut settings = Settings { legacy: Some((3900, 300)), ..Settings::default() };
+        apply_drag(&mut settings, &displays(), Drag { monitor: "laptop".into(), position: (3950, 320), cursor: Some((4325, 350)), generation: 0 });
+        assert_eq!(settings.monitor.as_deref(), Some("laptop"));
+        assert_eq!(targets(&displays(), &settings)[0].monitor, "laptop");
+        // A chosen screen stays chosen.
+        let mut settings = Settings { monitor: Some("main".into()), ..Settings::default() };
+        apply_drag(&mut settings, &displays(), Drag { monitor: "main".into(), position: (100, 80), cursor: Some((475, 110)), generation: 0 });
+        assert_eq!(settings.monitor.as_deref(), Some("main"));
     }
     #[test]
     fn legacy_position_is_used_until_new_per_screen_positions_exist() {
@@ -630,10 +704,10 @@ mod tests {
         let mut p = PlacementState::default();
         p.update(Settings::default());
         let started = p.generation;
-        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), generation: started });
+        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), cursor: None, generation: started });
         p.update(Settings { anchor: "bottom-right".into(), ..Settings::default() });
         assert!(!p.finish_drags(&displays()));
-        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), generation: started });
+        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), cursor: None, generation: started });
         assert!(!p.finish_drags(&displays()));
         assert!(p.settings.positions.is_empty());
         assert_eq!(p.settings.anchor, "bottom-right");
@@ -642,7 +716,7 @@ mod tests {
     fn a_drag_save_echo_does_not_invalidate_another_current_drag() {
         let mut p = PlacementState::default();
         p.update(Settings::default());
-        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), generation: p.generation });
+        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), cursor: None, generation: p.generation });
         assert!(p.finish_drags(&displays()));
         let generation = p.generation;
         assert!(!p.update(p.settings.clone()));
@@ -652,7 +726,7 @@ mod tests {
     fn explicit_reset_invalidates_a_drag_even_if_saved_preferences_were_already_empty() {
         let mut p = PlacementState::default();
         p.update(Settings::default());
-        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), generation: p.generation });
+        p.completed.push(Drag { monitor: "main".into(), position: (100, 80), cursor: None, generation: p.generation });
         assert!(!p.update(Settings::default()));
         p.reset_drags();
         assert!(!p.finish_drags(&displays()));
@@ -690,6 +764,49 @@ mod tests {
         let (reset, _) = p.next_save().unwrap();
         assert!(reset.positions.is_empty());
         assert_eq!(reset.anchor, "bottom-right");
+    }
+    #[test]
+    fn an_unrelated_snapshot_from_before_an_inflight_save_keeps_the_drag() {
+        let mut p = PlacementState::default();
+        let mut before = Settings::default();
+        before.positions.insert("main".into(), (100, 80));
+        p.update(before.clone());
+        p.completed.push(Drag { monitor: "main".into(), position: (900, 300), cursor: None, generation: p.generation });
+        assert!(p.finish_drags(&displays()));
+        assert!(p.queue_save());
+        let (sent, generation) = p.next_save().unwrap();
+        // A second drag is queued behind the request.
+        p.completed.push(Drag { monitor: "main".into(), position: (1200, 400), cursor: None, generation });
+        assert!(p.finish_drags(&displays()));
+        assert!(!p.queue_save());
+        // A theme change or zoom step committed just before the save: its 'prefs' still
+        // carries the old position.
+        assert!(!p.update(before.clone()), "the capsule does not snap back");
+        assert_eq!(p.settings.positions["main"], (1200, 400));
+        assert_eq!(p.generation, generation);
+        assert!(!p.update(sent.clone()), "the request's own echo");
+        p.saved(&sent, generation, true);
+        let (next, _) = p.next_save().expect("the queued drag is still saved");
+        assert_eq!(next.positions["main"], (1200, 400), "not the old position");
+        p.saved(&next, generation, true);
+        assert!(p.next_save().is_none());
+    }
+    #[test]
+    fn reset_during_an_inflight_save_wins_even_when_it_restores_the_old_empty_state() {
+        let mut p = PlacementState::default();
+        p.update(Settings::default());
+        p.completed.push(Drag { monitor: "main".into(), position: (900, 300), cursor: None, generation: p.generation });
+        assert!(p.finish_drags(&displays()));
+        p.queue_save();
+        let (sent, generation) = p.next_save().unwrap();
+        // 恢复预设位置: the core's answer equals the state before the drag.
+        p.update(Settings::default());
+        p.reset_placement();
+        assert!(p.settings.positions.is_empty());
+        assert!(!p.update(sent.clone()));
+        p.saved(&sent, generation, true);
+        let (reset, _) = p.next_save().expect("the reset is saved after the drag's request");
+        assert!(reset.positions.is_empty() && p.settings.positions.is_empty());
     }
     #[test]
     fn an_old_complete_save_snapshot_cannot_restore_the_previous_anchor() {

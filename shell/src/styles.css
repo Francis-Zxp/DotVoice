@@ -22,6 +22,8 @@
   --engine-openless: #7c3aed;
   --engine-openless-text: #7c3aed;
   --engine-volc-text: #2850c8;
+  --engine-dashscope-text: #9c3d00;
+  --engine-hotkey-text: #066258;
   --input: #5a5fd8;
   --input-2: #8a7cf0;
   --notes: #dd8530;
@@ -34,6 +36,9 @@
   --text: #17181c;
   --text-2: rgba(23, 24, 28, .64);
   --text-3: rgba(23, 24, 28, .42);
+  /* Secondary text that carries information (.faint): AA on the panels and the window.
+     --text-3 stays for icons, placeholders and decoration. */
+  --text-faint: rgba(23, 24, 28, .62);
   --hair: rgba(16, 18, 30, .075);
   --window: #e9eaf0;
   --amb-a: rgba(128, 112, 255, .3);
@@ -73,9 +78,12 @@
     --ring: color-mix(in srgb, #8f88ff 85%, transparent);
     --engine-openless-text: #a78bfa;
     --engine-volc-text: #8aa8ff;
+    --engine-dashscope-text: #ffa066;
+    --engine-hotkey-text: #4fd1bd;
     --text: #f3f3f6;
     --text-2: rgba(243, 243, 246, .66);
     --text-3: rgba(243, 243, 246, .42);
+    --text-faint: rgba(243, 243, 246, .58);
     --hair: rgba(255, 255, 255, .07);
     --window: #0e0f14;
     --amb-a: rgba(104, 96, 236, .26);
@@ -109,9 +117,12 @@
   --ring: color-mix(in srgb, #8f88ff 85%, transparent);
   --engine-openless-text: #a78bfa;
   --engine-volc-text: #8aa8ff;
+  --engine-dashscope-text: #ffa066;
+  --engine-hotkey-text: #4fd1bd;
   --text: #f3f3f6;
   --text-2: rgba(243, 243, 246, .66);
   --text-3: rgba(243, 243, 246, .42);
+  --text-faint: rgba(243, 243, 246, .58);
   --hair: rgba(255, 255, 255, .07);
   --window: #0e0f14;
   --amb-a: rgba(104, 96, 236, .26);
@@ -151,6 +162,7 @@
   --float: rgba(30, 33, 42, .84);
   --text-2: #dce0e9;
   --text-3: #a9afbe;
+  --text-faint: #a9afbe;
   --brand-text: #b4afff;
   --engine-volc-text: #94b0ff;
   --edge: rgba(233, 239, 255, .1);
@@ -450,7 +462,7 @@ html.preview:not(.overlay)[data-theme="glass"] body {
   .title-md { font-size: 15px; font-weight: 650; letter-spacing: -.003em; }
   .title-sm { font-size: 14px; font-weight: 620; }
   .muted { color: var(--text-2); }
-  .faint { color: var(--text-3); }
+  .faint { color: var(--text-faint); }
   .mark { border-radius: 4px; box-shadow: inset 0 -.42em 0 color-mix(in srgb, var(--mode, var(--brand)) 18%, transparent); }
   .kbd { display: inline-flex; align-items: center; height: 18px; padding: 0 5px; border-radius: 5px; font-size: 11px; font-weight: 600; background: var(--field); box-shadow: inset 0 -1px 0 var(--hair), inset 0 0 0 1px var(--hair); color: var(--text-2); }
 
@@ -557,8 +569,9 @@ html.preview:not(.overlay)[data-theme="glass"] body {
   }
   .stage-flood {
     position: absolute; inset: 0; z-index: 0; pointer-events: none; opacity: 0; border-radius: inherit;
-    background: radial-gradient(120% 80% at 0% 0%, color-mix(in srgb, var(--mode-2) 90%, white), transparent 60%),
-      linear-gradient(160deg, var(--mode-2), var(--mode) 55%, color-mix(in srgb, var(--mode) 82%, black));
+    /* White type sits on it (status line, words): no white-mixed highlight, deep enough for
+       ≥ 3.5:1 in every mode (notes amber was 1.8:1 under a pale corner). */
+    background: linear-gradient(160deg, color-mix(in srgb, var(--mode) 86%, black), color-mix(in srgb, var(--mode) 58%, black));
     transition: opacity .6s var(--ease);
   }
   .stage[data-listening="true"] .stage-flood { opacity: 1; }
@@ -569,6 +582,7 @@ html.preview:not(.overlay)[data-theme="glass"] body {
   }
   .stage > :not(.stage-flood):not(.stage-glow) { position: relative; z-index: 1; }
   .stage[data-listening="true"] { color: #fff; }
+  .stage[data-listening="true"] header { text-shadow: 0 1px 2px rgba(0, 0, 0, .25); }
   .orb-btn {
     position: relative; display: grid; place-items: center; width: 64px; height: 64px; border: 0; border-radius: 999px;
     color: #fff; background: linear-gradient(160deg, var(--brand-2), var(--brand) 55%, var(--brand-strong));
@@ -1070,5 +1084,6 @@ html.preview:not(.overlay)[data-theme="glass"] body {
   }
   .capsule .shimmer * { -webkit-text-fill-color: transparent; }
   @keyframes shimmer { to { background-position: -200% 0; } }
-  @keyframes score-in { from { opacity: 0; transform: translateY(5px); filter: blur(3px); } }
+  /* Per character (inline spans: a transform would not apply); opacity only, no blur per glyph. */
+  @keyframes score-in { from { opacity: 0; } }
 }

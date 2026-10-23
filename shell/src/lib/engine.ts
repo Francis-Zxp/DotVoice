@@ -35,7 +35,8 @@ export const ENGINE_TONE: Record<EngineKind, string> = {
     hint's button). ENGINE_TONE stays the fill, dark enough for a white glyph; on a dark theme
     text needs a lighter shade, which the theme's --engine-*-text token gives. */
 export const ENGINE_TONE_TEXT: Record<EngineKind, string> = {
-  volc: 'var(--engine-volc-text, #2850c8)', dashscope: ENGINE_TONE.dashscope, openless: 'var(--engine-openless-text, #7c3aed)', hotkey: ENGINE_TONE.hotkey,
+  volc: 'var(--engine-volc-text, #2850c8)', dashscope: 'var(--engine-dashscope-text, #9c3d00)',
+  openless: 'var(--engine-openless-text, #7c3aed)', hotkey: 'var(--engine-hotkey-text, #066258)',
 };
 
 /** The custom properties an engine card or choice sets: --tone (fill) and --tone-text. */

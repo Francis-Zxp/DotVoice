@@ -11,6 +11,10 @@ from urllib.parse import urlparse
 import uuid
 import websocket
 
+# OpenLess quit, crashed or restarted (e.g. for an update) without closing the socket cleanly.
+LOST = 'OpenLess 连接中断（可能已退出或重启）；不会重放本段音频'
+UNKNOWN_REPLY = 'OpenLess 返回了无法识别的数据，此版本可能需要更新协议适配'
+
 
 class BackendBusy(RuntimeError):
     """The recognizer is serving another session; retrying later is safe."""
@@ -92,8 +96,15 @@ class OpenLessBackend(VoiceBackend):
         try:
             # "partials": opt into live transcript frames (design/openless-live-text);
             # OpenLess versions without that support ignore the extra field.
-            ws.send(json.dumps({"type": "hello", "pin": pin, "partials": True}))
-            auth = json.loads(ws.recv())
+            try:
+                ws.send(json.dumps({"type": "hello", "pin": pin, "partials": True}))
+                auth = json.loads(ws.recv())
+            except (websocket.WebSocketTimeoutException, TimeoutError):
+                raise RuntimeError('OpenLess 没有回应配对请求（超时），请确认 OpenLess 已启动') from None
+            except (websocket.WebSocketException, OSError):
+                raise RuntimeError('OpenLess 远程输入暂不可达；保持启用时将自动重连') from None
+            except ValueError:
+                auth = None
             if not isinstance(auth, dict) or auth.get('type') != 'auth':
                 raise RuntimeError('OpenLess 握手格式已变化，此版本需要更新协议适配')
             if not auth.get("ok"):
@@ -102,13 +113,24 @@ class OpenLessBackend(VoiceBackend):
             self.ws = ws
             self.last_ping = time.monotonic()
         except Exception:
-            ws.close()
+            try:
+                ws.close()
+            except Exception:
+                pass   # the error above is the one to report
             raise
 
     def _send(self, kind):
         if not self.ws:
             raise RuntimeError("OpenLess 未连接")
-        self.ws.send(json.dumps({"type": kind}))
+        self._write(json.dumps({"type": kind}))
+
+    def _write(self, data, **options):
+        try:
+            self.ws.send(data, **options)
+        except websocket.WebSocketTimeoutException:
+            raise RuntimeError('OpenLess 没有及时接收数据（可能卡住）；不会重放本段音频') from None
+        except (websocket.WebSocketException, OSError):
+            raise RuntimeError(LOST) from None
 
     def start(self):
         self.connect()
@@ -116,7 +138,7 @@ class OpenLessBackend(VoiceBackend):
             raise RuntimeError("上一段识别尚未结束")
         # Ordered on the same socket before start. This is per-connection, so
         # it does not alter OpenLess shortcuts, settings, or other clients.
-        self.ws.send(json.dumps({"type": "set_insert", "value": self.insert_text}))
+        self._write(json.dumps({"type": "set_insert", "value": self.insert_text}))
         self._send("start")
         deadline = time.monotonic() + 9
         while time.monotonic() < deadline:
@@ -138,8 +160,7 @@ class OpenLessBackend(VoiceBackend):
     def feed(self, pcm):
         if not self.session_id:
             raise RuntimeError("没有已确认的录音会话")
-        self.ws.send(audio_frame(self.session_id, self.sequence, pcm),
-                     opcode=websocket.ABNF.OPCODE_BINARY)
+        self._write(audio_frame(self.session_id, self.sequence, pcm), opcode=websocket.ABNF.OPCODE_BINARY)
         self.sequence += 1
 
     def stop(self):
@@ -149,26 +170,35 @@ class OpenLessBackend(VoiceBackend):
     def poll(self):
         if not self.ws:
             return None
-        if time.monotonic() - self.last_ping > 20:
-            self.ws.ping()
-            self.last_ping = time.monotonic()
         try:
+            if time.monotonic() - self.last_ping > 20:
+                self.last_ping = time.monotonic()   # (a ping that timed out is not retried every poll)
+                self.ws.ping()
             value = self.ws.recv()
         except websocket.WebSocketTimeoutException:
             return None
+        except (websocket.WebSocketException, OSError):
+            raise RuntimeError(LOST) from None
         if value == "" or value is None:
-            raise RuntimeError("OpenLess 连接中断；不会重放本段音频")
+            raise RuntimeError(LOST)
         if not isinstance(value, str):
             return None
-        event = json.loads(value)
+        try:
+            event = json.loads(value)
+        except ValueError:
+            event = None
+        if not isinstance(event, dict):
+            raise RuntimeError(UNKNOWN_REPLY)
         if event.get("type") == "result" or event.get("kind") == "error":
             self.session_id = None
         return event
 
     def cancel(self):
-        if self.ws:
-            self._send("cancel")
-        self.session_id = None
+        try:
+            if self.ws:
+                self._send("cancel")
+        finally:
+            self.session_id = None
 
     def close(self):
         if self.ws:

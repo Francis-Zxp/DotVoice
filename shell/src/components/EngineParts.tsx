@@ -21,7 +21,11 @@ export async function setEngine(patch: Record<string, unknown>): Promise<Prefs |
 export function useEngineData(enabled = true) {
   const [hotkeys, setHotkeys] = useState<HotkeyDetect | null>(null);
   const [openless, setOpenless] = useState<OpenLessStatus | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(enabled);
+  // A probe that failed (core down, a timeout) is said as such and can be retried: never an
+  // endless "正在检测".
+  const [failed, setFailed] = useState(false);
+  const coreDown = useStore((s) => !!s.coreDown);
   const refresh = useCallback(async () => {
     setLoading(true);
     const [apps, status] = await Promise.all([
@@ -30,14 +34,17 @@ export function useEngineData(enabled = true) {
     ]);
     setHotkeys(apps);
     setOpenless(status);
+    setFailed(!apps || !status);
     setLoading(false);
   }, []);
+  // Again once a restarted core is back (meanwhile: failed, not "正在检测").
   useEffect(() => {
     if (!enabled) return;
+    if (coreDown) { setLoading(false); setFailed(true); return; }
     refresh();
     useStore.getState().refreshSecrets();
-  }, [enabled, refresh]);
-  return { hotkeys, openless, loading, refresh };
+  }, [enabled, coreDown, refresh]);
+  return { hotkeys, openless, loading, failed, refresh };
 }
 
 /** An API key: masked once saved (更换 / 清除), a password field while typing. */
@@ -115,6 +122,8 @@ export function TextField({ value, onSave, label, placeholder, width = 280, nume
 }) {
   const [draft, setDraft] = useState(value);
   const [ok, setOk] = useState(false);
+  // Esc: leave without saving (blur runs commit with this render's draft, still the typed text).
+  const skip = useRef(false);
   useEffect(() => setDraft(value), [value]);
   useEffect(() => {
     if (!ok) return;
@@ -122,6 +131,7 @@ export function TextField({ value, onSave, label, placeholder, width = 280, nume
     return () => clearTimeout(t);
   }, [ok]);
   async function commit() {
+    if (skip.current) { skip.current = false; setDraft(value); return; }
     const text = draft.trim();
     if (text === value) { setDraft(value); return; }
     if (await onSave(text)) setOk(true);
@@ -134,7 +144,7 @@ export function TextField({ value, onSave, label, placeholder, width = 280, nume
         onChange={(e) => setDraft(e.target.value)} onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') e.currentTarget.blur();
-          if (e.key === 'Escape') { setDraft(value); e.currentTarget.blur(); }
+          if (e.key === 'Escape') { skip.current = true; setDraft(value); e.currentTarget.blur(); }
         }} />
       <AnimatePresence>
         {ok && (

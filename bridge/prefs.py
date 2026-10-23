@@ -12,6 +12,7 @@ import time
 ENGINE_KINDS = ('openless', 'volc', 'dashscope', 'hotkey')
 RECOVERED = 'prefs-recovered.json'  # where settings go while prefs.json cannot be read
 READ_RETRY = .25                    # another program (antivirus, backup) briefly holding it
+READ_ATTEMPTS = 5                   # about a second before a busy prefs.json is given up on
 VOLC_ENDPOINTS = ('bigmodel_async', 'bigmodel', 'bigmodel_nostream')
 VOLC_RESOURCE = 'volc.seedasr.sauc.duration'
 DASHSCOPE_MODEL = 'fun-asr-realtime'
@@ -33,7 +34,9 @@ DEFAULTS = {
     'appearance': {'theme': 'system', 'reduced_motion': False, 'live_shortcut': True},
     'present': {'tool': 'laser', 'hide_cursor': True, 'zoom': 200},
     # 气声: auto = lift speech that stays soft, on = every recording, off = untouched.
-    'voice': {'whisper': 'auto'},
+    # armed: whether the user last turned the voice on (启用) or off (暂停); written only by
+    # the user's own arm / pause, read at start when general.restore_armed is on.
+    'voice': {'whisper': 'auto', 'armed': False},
     # 随拿随用: the Baseus pen and Tidepool both stay ready; OpenLess runs one session at a time.
     'devices': {'coexist': True},
     # Swallow the PowerPoint shortcuts the pen also types (⑧ Ctrl+P = print) outside slideshows.
@@ -58,7 +61,8 @@ DEFAULTS = {
     # run_elevated (兼容管理员权限窗口): DotVoice runs as administrator so its clicks and typing
     # reach elevated windows. Only the shell changes it (elevation.rs: UAC, the logon task,
     # the restart); it mirrors whether that task exists. Never switched on automatically.
-    'general': {'run_elevated': False},
+    # restore_armed: after a restart (logon, update) the voice comes back on if it was on.
+    'general': {'run_elevated': False, 'restore_armed': True},
 }
 
 # Each leaf validator returns the cleaned value or raises ValueError.
@@ -85,9 +89,24 @@ def _bool(value):
 
 
 def _accelerator(value):
+    """A global shortcut the shell registers for every program ('Ctrl+Shift+M'); '' = none.
+    Same rule as the settings recorder (shell/src/lib/hotkey.ts): a bare key would be taken
+    from every app (F5 starts a PowerPoint show), so only F13–F24 may stand alone, and Tab /
+    Shift+Tab stay focus moves. An older prefs.json holding one is reset to none on load."""
     if not isinstance(value, str) or len(value) > 64:
         raise ValueError('快捷键无效')
-    return value.strip()
+    value = value.strip()
+    if not value:
+        return ''
+    parts = [part.strip() for part in value.split('+')]
+    key, modifiers = parts[-1].lower(), {part.lower() for part in parts[:-1]}
+    if not key or '' in modifiers:
+        raise ValueError('快捷键无效')
+    if key == 'tab' and modifiers <= {'shift'}:
+        raise ValueError('Tab 和 Shift+Tab 用于切换焦点，不能设为快捷键')
+    if not modifiers and not re.fullmatch(r'f(1[3-9]|2[0-4])', key):
+        raise ValueError('快捷键需要配合 Ctrl、Alt、Shift 或 Win（只有 F13–F24 可以单独使用）')
+    return value
 
 
 def _position(value):
@@ -197,7 +216,7 @@ SCHEMA = {
                    'live_shortcut': _bool},
     'present': {'tool': _choice('laser', 'spotlight', 'magnifier', 'mouse'), 'hide_cursor': _bool,
                 'zoom': _int_range(125, 400)},  # magnifier, percent
-    'voice': {'whisper': _choice('auto', 'on', 'off')},
+    'voice': {'whisper': _choice('auto', 'on', 'off'), 'armed': _bool},
     'devices': {'coexist': _bool},
     'pen': {'guard_shortcuts': _bool},
     'diagnostics': {'save_audio': _bool},
@@ -211,7 +230,7 @@ SCHEMA = {
         'hotkey': {'profile': _hotkey_profile, 'keys': _combo, 'style': _choice('toggle', 'hold')},
     },
     'setup': {'done': _bool},
-    'general': {'run_elevated': _bool},
+    'general': {'run_elevated': _bool, 'restore_armed': _bool},
 }
 
 
@@ -246,14 +265,21 @@ def _load(target, saved, schema):
             pass
 
 
-def _read(path):
+def _recovered(path):
+    """Where settings go while `path` cannot be read: prefs-recovered.json (RECOVERED) beside
+    prefs.json; the self-test's smoke-prefs.json has its own and never touches the real one."""
+    return path.with_name(path.stem + '-recovered.json')
+
+
+def _read(path, attempts=None):
     """(settings, None) or (None, 'busy' | 'corrupt'). A file another program holds open
-    (Windows sharing violation) is tried once more before giving up."""
-    for attempt in (0, 1):
+    (Windows sharing violation) is tried a few more times before giving up."""
+    attempts = attempts or READ_ATTEMPTS
+    for attempt in range(attempts):
         try:
             saved = json.loads(path.read_text(encoding='utf-8'))
         except OSError:
-            if attempt:
+            if attempt == attempts - 1:
                 return None, 'busy'
             time.sleep(READ_RETRY)
             continue
@@ -282,12 +308,13 @@ class Preferences:
             self.data['setup']['done'] = True
         if found:
             saved, problem = _read(self.path)
+            recovered = _recovered(self.path)
             if saved is not None:
                 _load(self.data, saved, SCHEMA)
+                self._carry_recovered(recovered)
             else:
                 # prefs.json is kept as it is. Changes go to prefs-recovered.json, which is read
                 # back while prefs.json stays unreadable - and the user is told every time.
-                recovered = self.path.with_name(RECOVERED)
                 kept = _read(recovered)[0] if recovered.exists() else None
                 if kept is not None:
                     _load(self.data, kept, SCHEMA)
@@ -303,6 +330,27 @@ class Preferences:
                     _merge(self.data, patch, SCHEMA)
                 except (ValueError, KeyError, TypeError):
                     pass
+
+    def _carry_recovered(self, recovered):
+        """prefs.json is readable again. Settings saved to the recovered copy since (prefs.json
+        was busy at the last start) are kept, and the copy is retired either way: a stale one
+        must never come back if prefs.json is ever really damaged later."""
+        try:
+            newer = recovered.stat().st_mtime > self.path.stat().st_mtime
+        except OSError:
+            return  # no recovered copy: the usual case
+        if newer:
+            kept = _read(recovered, 1)[0]
+            if kept is not None:
+                _load(self.data, kept, SCHEMA)
+                try:
+                    self._write(self.data)
+                except OSError:
+                    return  # prefs.json still not writable: the copy stays for the next start
+        try:
+            recovered.replace(recovered.with_name(recovered.name + '.bak'))
+        except OSError:
+            pass
 
     def get(self, *keys):
         with self.lock:

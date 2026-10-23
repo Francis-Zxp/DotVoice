@@ -400,6 +400,14 @@ class CoreGuardTests(unittest.TestCase):
         core._devices_changed([])  # no receiver: nothing to guard
         self.assertEqual(self.hook[-1], 'stop')
 
+    def test_other_keyboards_modifiers_reach_the_guard_while_only_the_air_mouse_runs(self):
+        core = self.core
+        core.prefs_set({'airmouse': {'enabled': True}, 'pen': {'guard_shortcuts': False}})
+        core._devices_changed(found(PATH))
+        self.assertTrue(core.airmouse.remap_enabled)
+        self.assertFalse(core.guard.enabled)
+        self.assertIsNotNone(core.monitor.on_foreign_key)
+
     def test_receiver_keys_and_vendor_codes_reach_the_guard(self):
         core = self.core
         core.on_hid({'kind': 1, 'path': KBD_PATH, 'keyboard': {'vk': 0x11, 'down': True}})

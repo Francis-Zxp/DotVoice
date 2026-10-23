@@ -27,22 +27,24 @@ export function AppUpdateCard() {
   const update = useStore((s) => s.appUpdate);
   const version = useStore((s) => s.version);
   const [checking, setChecking] = useState(false);
+  // The 6-hourly background check counts too: a manual check then returns at once.
+  const busy = checking || update?.status === 'checking';
   async function check() {
-    if (checking) return;
+    if (busy) return;
     setChecking(true);
     try {
       await act('check_updates', { force: true });
     } finally { setChecking(false); }
   }
-  const status = checking ? '正在检查 GitHub 发行版…'
+  const status = busy ? '正在检查 GitHub 发行版…'
     : update?.status === 'error' ? update.error || '检查失败，请稍后重试。'
     : update?.available ? `发现新版本 ${update.latest_version}。`
     : update?.status === 'current' ? '当前已是最新正式版。' : '运行时自动检查更新，也可以手动检查。';
   return (
     <Glass className="px-6 py-1" data-update-settings>
       <SettingRow icon={<Download size={17} />} title={`点声 ${version}`} description={status}>
-        <button className="btn btn-sm" disabled={checking} onClick={check}>
-          <RefreshCw size={14} className={checking ? 'animate-spin' : ''} />{checking ? '正在检查' : '检查更新'}
+        <button className="btn btn-sm" disabled={busy} onClick={check}>
+          <RefreshCw size={14} className={busy ? 'animate-spin' : ''} />{busy ? '正在检查' : '检查更新'}
         </button>
         <button className="btn btn-sm" onClick={() => act('open_url', { url: update?.available ? update.download_url : RELEASES })}>
           {update?.available ? '下载更新' : '发行页面'}

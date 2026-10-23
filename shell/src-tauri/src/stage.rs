@@ -17,7 +17,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow};
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
@@ -49,7 +49,8 @@ pub struct StageState {
     pub changed: Condvar,
     pub shown: AtomicBool,
     placement: Mutex<Option<Placement>>,
-    pointer: Mutex<(Option<bool>, bool)>, // (⑤ held: Some(is laser) / None, ② laser latched)
+    /// (⑤ held: Some(is laser) / None, ② laser latched, annotation pen down)
+    pointer: Mutex<(Option<bool>, bool, bool)>,
     look: Mutex<Look>,
 }
 
@@ -118,18 +119,27 @@ pub fn show(app: &AppHandle) {
     rescale_laser(&state);
 }
 
-/// The page found nothing left to draw. Ignored while ⑤ is held or ② latched: an
-/// idle report can arrive just after a new press and must not hide its laser.
-pub fn hide_if_idle(app: &AppHandle) {
+/// The page found nothing left to draw. Ignored while ⑤ is held, ② latched or the pen
+/// down: an idle report can arrive just after a new press and must not hide its laser or
+/// stroke. Checked and hidden under one lock, so a press cannot slip in between.
+pub fn hide_if_idle<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<StageState>();
-    let (held, latch) = *state.pointer.lock().unwrap();
-    if held.is_none() && !latch {
-        hide(app);
+    // Taken: a press, stroke or hide is being recorded right now (not idle, or hidden anyway).
+    // Never wait for it on the main thread: the reader's hide() holds it while ShowWindow
+    // waits for the main thread.
+    let Ok(mut pointer) = state.pointer.try_lock() else { return };
+    if *pointer == (None, false, false) {
+        hide_locked(app, &state, &mut pointer);
     }
 }
 
-pub fn hide(app: &AppHandle) {
+pub fn hide<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<StageState>();
+    let mut pointer = state.pointer.lock().unwrap();
+    hide_locked(app, &state, &mut pointer);
+}
+
+fn hide_locked<R: Runtime>(app: &AppHandle<R>, state: &StageState, pointer: &mut (Option<bool>, bool, bool)) {
     *state.active.lock().unwrap() = false;
     state.changed.notify_all();
     if state.shown.swap(false, Ordering::SeqCst) {
@@ -140,12 +150,17 @@ pub fn hide(app: &AppHandle) {
             }
         }
     }
-    *state.pointer.lock().unwrap() = (None, false);
+    *pointer = (None, false, false);
     set_cursor_look(app, Look::Normal);
 }
 
+/// The annotation pen went down (a stroke starts) or up.
+pub fn annotate<R: Runtime>(app: &AppHandle<R>, down: bool) {
+    app.state::<StageState>().pointer.lock().unwrap().2 = down;
+}
+
 /// Pointer events from the core: track what is shown and hide/restore the system cursor.
-pub fn pointer(app: &AppHandle, tool: &str, active: bool, latched: bool, hide_cursor: bool) {
+pub fn pointer<R: Runtime>(app: &AppHandle<R>, tool: &str, active: bool, latched: bool, hide_cursor: bool) {
     let state = app.state::<StageState>();
     let draws = tool == "laser" || tool == "spotlight";
     let (held, latch) = {
@@ -155,7 +170,7 @@ pub fn pointer(app: &AppHandle, tool: &str, active: bool, latched: bool, hide_cu
         } else {
             pointer.0 = (active && draws).then_some(tool == "laser");
         }
-        *pointer
+        (pointer.0, pointer.1)
     };
     let look = if !hide_cursor {
         Look::Normal
@@ -182,7 +197,7 @@ pub fn set_cursor_hidden(app: &AppHandle, hidden: bool) {
     set_cursor_look(app, if hidden { Look::Hidden } else { Look::Normal });
 }
 
-pub fn set_cursor_look(app: &AppHandle, look: Look) {
+pub fn set_cursor_look<R: Runtime>(app: &AppHandle<R>, look: Look) {
     let state = app.state::<StageState>();
     // Held for the whole apply: the cursor thread (rescale), the core reader
     // (pointer) and the main thread (hide) can never interleave, so the cursor
@@ -439,9 +454,51 @@ pub fn start_cursor_stream(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{laser_cursor, laser_pixel};
+    use super::{annotate, hide, hide_if_idle, laser_cursor, laser_pixel, pointer, StageState};
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
     use windows_sys::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
     use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyCursor, GetIconInfo, ICONINFO};
+
+    /// hide_cursor stays off throughout: the real system pointer is never touched here.
+    #[test]
+    fn an_idle_report_does_not_hide_a_stroke_or_laser_that_just_started() {
+        let app = tauri::test::mock_app();
+        app.manage(StageState::default());
+        let app = app.handle();
+        let state = app.state::<StageState>();
+        let show = || {
+            state.shown.store(true, Ordering::SeqCst);
+            *state.active.lock().unwrap() = true;
+        };
+        let shown = || state.shown.load(Ordering::SeqCst) && *state.active.lock().unwrap();
+        // The pen goes down just before the page's (450 ms) idle report arrives.
+        show();
+        annotate(app, true);
+        hide_if_idle(app);
+        assert!(shown(), "the stroke that just started stays");
+        annotate(app, false);
+        hide_if_idle(app);
+        assert!(!shown());
+        show();
+        pointer(app, "laser", true, false, false);
+        hide_if_idle(app);
+        assert!(shown(), "the laser that was just pressed stays");
+        pointer(app, "laser", false, false, false);
+        hide_if_idle(app);
+        assert!(!shown());
+        // A press being recorded right now: the report is dropped, never waited for.
+        show();
+        let recording = state.pointer.lock().unwrap();
+        hide_if_idle(app);
+        drop(recording);
+        assert!(shown());
+        // A mode change hides it all and lifts the pen.
+        annotate(app, true);
+        hide(app);
+        assert!(!shown());
+        assert_eq!(*state.pointer.lock().unwrap(), (None, false, false));
+    }
 
     /// The real Windows cursor is created (32-bit colour, centred hotspot, sized per scale).
     #[test]

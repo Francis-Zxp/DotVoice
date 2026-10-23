@@ -276,7 +276,7 @@ class PrefsTests(unittest.TestCase):
     def test_run_elevated_is_off_by_default_and_only_takes_a_switch(self):
         with tempfile.TemporaryDirectory() as folder:
             prefs = Preferences(Path(folder) / 'prefs.json')
-            self.assertEqual(prefs.get('general'), {'run_elevated': False})
+            self.assertEqual(prefs.get('general'), {'run_elevated': False, 'restore_armed': True})
             self.assertTrue(prefs.update({'general': {'run_elevated': True}})['general']['run_elevated'])
             with self.assertRaises(ValueError):
                 prefs.update({'general': {'run_elevated': 'yes'}})

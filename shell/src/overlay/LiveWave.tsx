@@ -54,14 +54,17 @@ export function LiveWave({ width, height, state, tone, onColor = false, reduced,
     const canvas = ref.current!;
     const ctx = canvas.getContext('2d')!;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
+    const w = Math.round(width * dpr), h = Math.round(height * dpr);
+    // Assigning clears the bitmap even to the same size: only on a real resize, so a state
+    // change (listening → thinking) never blanks the line.
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
     let colours = readColours(canvas, onColor);
     // Styles may land a frame later (mode class swap): read once more.
     const reread = requestAnimationFrame(() => { colours = readColours(canvas, onColor); });
     let raf = 0;
     let { level, phase } = motion.current;
-    let last = performance.now();
+    let last = performance.now() - 1000 / 30;  // the first frame paints at once
     let glint = 0;
     const started = last;
     const mid = height / 2;

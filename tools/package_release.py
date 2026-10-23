@@ -8,7 +8,7 @@ import zipfile
 
 root = Path(__file__).resolve().parents[1]
 out = root / 'release'
-version = '0.11.6'
+version = '0.11.8'
 portable = out / f'DotVoice-{version}-windows-x64.zip'
 source = out / f'DotVoice-{version}-source.zip'
 SKIP_DIRS = {'__pycache__', 'references', 'device-refs', 'backups', 'runtime', 'node_modules', 'target', 'dist', 'gen', '.venv', '.git'}
@@ -36,7 +36,7 @@ def skipped(relative):
 
 def source_entries():
     files = ['core_main.py', 'config.json', 'requirements.txt', 'requirements-build.txt', 'build.ps1',
-             'README.md', 'VALIDATION.md', 'ACCEPTANCE.md', 'RELEASE_0.9.6.md', 'RELEASE_0.11.5.md', 'RELEASE_0.11.6.md', '.gitignore', 'LICENSE',
+             'README.md', 'VALIDATION.md', 'ACCEPTANCE.md', 'RELEASE_0.9.6.md', 'RELEASE_0.11.5.md', 'RELEASE_0.11.6.md', 'RELEASE_0.11.7.md', 'RELEASE_0.11.8.md', '.gitignore', 'LICENSE',
              'THIRD_PARTY_PV60.md', 'RELEASING.md', '.gitattributes']
     entries = [(root / name, Path('DotVoice-source') / name) for name in files]
     for folder in ['bridge', 'shell', 'tests', 'tools', 'design', 'licenses', 'integrations', 'installer', '.github']:

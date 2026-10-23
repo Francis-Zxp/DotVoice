@@ -1,13 +1,14 @@
 import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle, AppWindow, AudioLines, AudioWaveform, Bell, Bug, CircleDot, Command, Flashlight, FolderOpen, Hand, Keyboard, MousePointer2, MousePointerClick, Palette, Play,
-  Presentation, Printer, Radar, RotateCcw, ShieldAlert, ShieldCheck, Usb, Wand2, Wind, X, Zap, ZoomIn,
+  Power, Presentation, Printer, Radar, RotateCcw, ShieldAlert, ShieldCheck, Usb, Wand2, Wind, X, Zap, ZoomIn,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { StatusDot } from '../components/EngineParts';
 import { AppUpdateCard } from '../components/AppUpdate';
 import { Glass, PageHeader, Range, Segmented, SettingRow, spring, Switch } from '../components/ui';
-import { shell } from '../lib/bridge';
+import { call, shell } from '../lib/bridge';
+import { accelerator } from '../lib/hotkey';
 import { elevationView } from '../lib/elevation';
 import { bindingText, slotLabel } from '../lib/format';
 import { act, useStore } from '../lib/store';
@@ -184,6 +185,10 @@ export function SettingsPage() {
               <button className="btn btn-sm" onClick={openWizard}>重新运行</button>
             </SettingRow>
             <SettingRow icon={<AppWindow size={17} />} title="关闭后留在后台" description="关闭窗口后语音输入保持当前状态；双击托盘图标返回，右键可退出。" />
+            {/* prefs general.restore_armed (core): absent in an older core = on. */}
+            <SettingRow icon={<Power size={17} />} title="启动时恢复上次的语音启用状态" description="关闭后，每次启动需要手动点「启用语音」。">
+              <Switch label="启动时恢复上次的语音启用状态" checked={prefs.general?.restore_armed ?? true} onChange={(v) => set({ general: { restore_armed: v } })} />
+            </SettingRow>
             <ElevationRow prefs={prefs} />
             <SettingRow icon={<ShieldCheck size={17} />} title="隐私" description="默认不保存录音（只有在“语音识别”里打开调试录音时，才在本机保留最近 3 段，24 小时后自动删除）。普通输入不保存文字；笔记整段保存在本机。选豆包语音或阿里云百炼时，录音会实时发给对应的云服务识别；它们的密钥用 Windows 数据保护加密，只保存在这台电脑。电量、时长与次数只记录数字，每支笔分别统计。" />
           </Glass>
@@ -320,7 +325,7 @@ function BindingsCard() {
       <AnimatePresence mode="wait" initial={false}>
         <motion.div key={tab} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4, transition: { duration: .1 } }} transition={spring.soft}>
           {tab === 'tidepool' ? (
-            <p className="glass-flat mt-4 px-4 py-3 text-[13px]">Tidepool 的按键由它自己的接收器处理。请在“快捷键”中设置切换键；笔记路由将在下一版接入。</p>
+            <p className="glass-flat mt-4 px-4 py-3 text-[13px]">Tidepool 的按键由它自己的接收器处理。请在“快捷键”中设置切换键；它的录音由自己的接收器交给 OpenLess，暂不能记为点声笔记。</p>
           ) : (
             <div className="well mt-4">
               {slots.map((slot) => {
@@ -339,7 +344,8 @@ function BindingsCard() {
                     </div>
                     <div className="flex gap-1">
                       <button className="btn btn-sm" onClick={() => learn(slot)}>录制</button>
-                      {binding && !binding.default && <button className="btn btn-ghost btn-sm btn-icon" onClick={() => reset(slot)} title="恢复默认" aria-label="恢复默认"><RotateCcw size={14} /></button>}
+                      {/* A cleared slot that ships with a default can go back to it too. */}
+                      {(binding ? !binding.default : !!bindings?.defaults?.[tab]?.includes(slot)) && <button className="btn btn-ghost btn-sm btn-icon" onClick={() => reset(slot)} title="恢复默认" aria-label="恢复默认"><RotateCcw size={14} /></button>}
                       {binding && <button className="btn btn-ghost btn-sm btn-icon" onClick={() => clear(slot)} title="解除绑定" aria-label="解除绑定"><X size={14} /></button>}
                     </div>
                   </div>
@@ -375,6 +381,11 @@ function LearnDialog({ open, onClose }: { open: { device: string; slot: string }
     await act('binding_cancel');
     onClose();
   }
+  // Leaving the page with the dialog open (Ctrl+1…5) still ends the core's recording, or the
+  // next ordinary pen press would be saved as this binding.
+  const openRef = useRef(open);
+  openRef.current = open;
+  useEffect(() => () => { if (openRef.current) call('binding_cancel').catch(() => {}); }, []);
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') cancel(); };
@@ -427,19 +438,6 @@ function LearnDialog({ open, onClose }: { open: { device: string; slot: string }
   );
 }
 
-function accelerator(e: React.KeyboardEvent) {
-  const parts: string[] = [];
-  if (e.ctrlKey) parts.push('Ctrl');
-  if (e.altKey) parts.push('Alt');
-  if (e.shiftKey) parts.push('Shift');
-  if (e.metaKey) parts.push('Super');
-  const code = e.code;
-  if (['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(code)) return null;
-  const key = code.startsWith('Key') ? code.slice(3) : code.startsWith('Digit') ? code.slice(5) : code;
-  if (!parts.length && !/^F\d+$/.test(key)) return null;
-  return [...parts, key].join('+');
-}
-
 function HotkeyField({ value, onChange, label }: { value: string; onChange: (value: string) => void; label: string }) {
   const [recording, setRecording] = useState(false);
   return (
@@ -449,6 +447,8 @@ function HotkeyField({ value, onChange, label }: { value: string; onChange: (val
           value={recording ? '请按下组合键…' : value || '未设置'}
           onFocus={() => setRecording(true)} onBlur={() => setRecording(false)}
           onKeyDown={(e) => {
+            // Tab / Shift+Tab move focus as usual (blur ends recording); never a shortcut.
+            if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return;
             e.preventDefault();
             if (e.key === 'Escape') { (e.target as HTMLInputElement).blur(); return; }
             const accel = accelerator(e);
@@ -463,10 +463,10 @@ function HotkeyField({ value, onChange, label }: { value: string; onChange: (val
 function HotkeysCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
   return (
     <Glass className="px-6 py-1">
-      <SettingRow icon={<Command size={17} />} title="切换模式" description="任何程序在前台时都能用；适合 Tidepool 或不想用笔上按键时。需要包含 Ctrl / Alt / Shift / Win 之一。">
+      <SettingRow icon={<Command size={17} />} title="切换模式" description="任何程序在前台时都能用；适合 Tidepool 或不想用笔上按键时。需要包含 Ctrl / Alt / Shift / Win 之一（F13–F24 可单独使用）。">
         <HotkeyField label="切换模式快捷键" value={prefs.hotkeys.toggle_mode} onChange={(v) => setPrefs({ hotkeys: { toggle_mode: v } })} />
       </SettingRow>
-      <SettingRow icon={<AudioLines size={17} />} title="启用 / 暂停语音" description="点击输入框后按下组合键即可录入；Esc 取消。">
+      <SettingRow icon={<AudioLines size={17} />} title="启用 / 暂停语音" description="点击输入框后按下组合键即可录入；Esc 取消。需要包含 Ctrl / Alt / Shift / Win 之一（F13–F24 可单独使用）。">
         <HotkeyField label="启用暂停快捷键" value={prefs.hotkeys.arm_toggle} onChange={(v) => setPrefs({ hotkeys: { arm_toggle: v } })} />
       </SettingRow>
     </Glass>
@@ -532,7 +532,7 @@ function AirMouseCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs })
       <SettingRow title="放映时保持原样" description="PowerPoint / WPS 全屏放映时不点击、不抓起、不弹右键菜单、不滚动（放大镜调倍数除外），长按 ④ 照常黑屏。">
         <Switch label="放映时保持原样" checked={prefs.airmouse.skip_slideshow} onChange={(v) => setPrefs({ airmouse: { skip_slideshow: v } })} />
       </SettingRow>
-      <p className="faint pb-4 text-[12px] leading-relaxed">“按住 ⑤ + 音量键”是唯一的组合，也没有“用过飞鼠后几秒内”的隐藏规则；不按 ⑤ 时音量键保持原功能。演示模式下 ⑤ 双击换工具，③④ 保持原样。键盘钩子分不清是哪块键盘：抓起时键盘上的 PgUp 会放下。管理员权限的窗口不接受模拟点击。</p>
+      <p className="faint pb-4 text-[12px] leading-relaxed">“按住 ⑤ + 音量键”是唯一的组合，也没有“用过飞鼠后几秒内”的隐藏规则；不按 ⑤ 时音量键保持原功能。演示模式下 ⑤ 双击换工具，③④ 保持原样。键盘钩子分不清是哪块键盘：抓起时键盘上的 PgUp 会放下。{prefs.general?.run_elevated ? '' : '普通权限运行时点不到管理员权限的窗口，可在“通用 → 兼容管理员权限窗口”开启。'}</p>
       <LearnDialog open={learning} onClose={() => setLearning(null)} />
     </Glass>
   );
@@ -596,14 +596,14 @@ function PresentCard() {
 }
 
 const CUES: [string, string][] = [
-  ['mode_input', '切到输入'], ['mode_notes', '切到笔记'], ['start_input', '开始 · 输入'], ['start_notes', '开始 · 笔记'],
+  ['mode_input', '切到输入'], ['mode_notes', '切到笔记'], ['mode_present', '切到演示'], ['start_input', '开始 · 输入'], ['start_notes', '开始 · 笔记'],
   ['stop', '结束收音'], ['done_input', '已输入'], ['done_notes', '已保存'], ['error', '出错'], ['armed', '启用'], ['disarmed', '暂停'],
 ];
 
 function SoundsCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) {
   return (
     <Glass className="px-6 py-1">
-      <SettingRow title="声音提示" description="两种模式音色不同：输入清脆上扬，笔记温暖下行。">
+      <SettingRow title="声音提示" description="三种模式音色不同：输入清脆上扬，笔记温暖下行，演示柔和铺开。">
         <Switch label="声音提示" checked={prefs.sounds.enabled} onChange={(v) => setPrefs({ sounds: { enabled: v } })} />
       </SettingRow>
       <SettingRow title="保持音频设备唤醒" description="蓝牙音箱 / 耳机、显示器音频安静几秒后会休眠，吞掉第一声提示音。开启后保持一个听不见的音频流（蓝牙设备会稍多耗一点电）。">
@@ -694,11 +694,11 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
       <SettingRow title="预设位置" description={ANCHORS.find(item => item.value === anchor)?.label}>
         <div className="flex flex-col items-end gap-2">
           <div className="grid grid-cols-3 gap-1 rounded-xl p-1.5" role="group" aria-label="胶囊预设位置"
-            style={{ border: '1px solid var(--hair)', background: 'var(--well)' }}>
+            style={{ border: '1px solid var(--hair)', background: 'var(--field)' }}>
             {ANCHORS.map(item => <button key={item.value} className="btn btn-ghost h-7 w-8 min-w-0 p-0"
               aria-label={item.label} title={item.label} aria-pressed={anchor === item.value} disabled={placing}
               onClick={() => place({ anchor: item.value as OverlayAnchor })}
-              style={anchor === item.value ? { background: 'var(--brand)', color: '#fff' } : { color: 'var(--faint)' }}>
+              style={anchor === item.value ? { background: 'var(--brand)', color: '#fff' } : { color: 'var(--text-faint)' }}>
               <span className="h-1.5 w-3 rounded-full" style={{ background: 'currentColor', opacity: anchor === item.value ? 1 : .4 }} />
             </button>)}
           </div>
@@ -717,7 +717,10 @@ function CapsuleCard({ prefs, setPrefs }: { prefs: Prefs; setPrefs: SetPrefs }) 
 function ProbeCard() {
   const probe = useStore((s) => s.probe);
   const [on, setOn] = useState(false);
-  useEffect(() => () => { act('probe', { enabled: false }); }, []);
+  // Leaving the page turns a running probe off, quietly (the core may be restarting).
+  const onRef = useRef(false);
+  onRef.current = on;
+  useEffect(() => () => { if (onRef.current) call('probe', { enabled: false }).catch(() => {}); }, []);
   async function toggle(value: boolean) {
     if (await act('probe', { enabled: value })) setOn(value);
     if (value) useStore.setState({ probe: [] });

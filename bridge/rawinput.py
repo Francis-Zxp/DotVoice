@@ -1,9 +1,9 @@
 """Observe only the Baseus receiver. Never suppress or inject input events.
 
-The one exception to "only the receiver": while the shortcut guard runs, other
-keyboards' modifier keys (Shift/Ctrl/Alt/Win up/down, never any other key) are
-passed to `on_foreign_key`, so the guard knows a Ctrl+P typed on a real keyboard
-is not the pen's."""
+The one exception to "only the receiver": while the keyboard hook runs (shortcut
+guard or air-mouse remap), other keyboards' modifier keys (Shift/Ctrl/Alt/Win
+up/down, never any other key) are passed to `on_foreign_key`, so the guard knows a
+Ctrl+P or Shift+F5 typed on a real keyboard is not the pen's."""
 import ctypes as c
 from ctypes import wintypes as w
 import struct
@@ -17,6 +17,10 @@ WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_TIMER = 0xFF, 0xFE, 0x113
 WM_APP_MOUSE = 0x8001
 RIDEV_REMOVE, RIDEV_INPUTSINK, RIDEV_DEVNOTIFY = 0x1, 0x100, 0x2000
 FALLBACK_SCAN_MS = 30000  # device changes arrive as WM_INPUT_DEVICE_CHANGE
+# Nothing registered yet (no receiver at start): no WM_INPUT_DEVICE_CHANGE can arrive, so
+# look this often instead. Enumeration is cheap.
+EMPTY_SCAN_MS = 2000
+ERROR_INSUFFICIENT_BUFFER = 122
 user32 = c.WinDLL("user32", use_last_error=True)
 kernel32 = c.WinDLL("kernel32", use_last_error=True)
 LRESULT = c.c_ssize_t
@@ -51,6 +55,9 @@ class DeviceInfo(c.Structure):
 user32.GetRawInputDeviceList.argtypes = [c.c_void_p, c.POINTER(w.UINT), w.UINT]
 user32.GetRawInputDeviceInfoW.argtypes = [w.HANDLE, w.UINT, c.c_void_p, c.POINTER(w.UINT)]
 user32.GetRawInputData.argtypes = [w.HANDLE, w.UINT, c.c_void_p, c.POINTER(w.UINT), w.UINT]
+# They return UINT: a failure is (UINT)-1, which the default c_int restype turns into -1.
+user32.GetRawInputDeviceList.restype = user32.GetRawInputDeviceInfoW.restype = w.UINT
+user32.GetRawInputData.restype = w.UINT
 user32.RegisterRawInputDevices.argtypes = [c.POINTER(Registration), w.UINT, w.UINT]
 user32.DefWindowProcW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 user32.DefWindowProcW.restype = LRESULT
@@ -77,14 +84,23 @@ def device_name(handle):
 
 
 def devices(all_supported=False):
-    count = w.UINT()
-    user32.GetRawInputDeviceList(None, c.byref(count), c.sizeof(RawDevice))
-    entries = (RawDevice * count.value)()
-    result = user32.GetRawInputDeviceList(entries, c.byref(count), c.sizeof(RawDevice))
-    if result == 0xFFFFFFFF:
-        raise c.WinError(c.get_last_error())
+    # A device that arrives between the two calls (a receiver's HID collections arrive one
+    # by one) fails the second with ERROR_INSUFFICIENT_BUFFER: count again. Never return
+    # an empty list for a failed enumeration - that reads as "everything unplugged".
+    for _ in range(3):
+        count = w.UINT()
+        user32.GetRawInputDeviceList(None, c.byref(count), c.sizeof(RawDevice))
+        entries = (RawDevice * count.value)()
+        result = user32.GetRawInputDeviceList(entries, c.byref(count), c.sizeof(RawDevice))
+        if result != 0xFFFFFFFF:
+            break
+        error = c.get_last_error()
+        if error != ERROR_INSUFFICIENT_BUFFER:
+            raise c.WinError(error)
+    else:
+        raise c.WinError(ERROR_INSUFFICIENT_BUFFER)
     found = []
-    for entry in entries[:count.value]:
+    for entry in entries[:result]:
         name = device_name(entry.handle)
         if VID_PID not in name and not (all_supported and 'VID_0611&PID_3001' in name):
             continue
@@ -161,6 +177,8 @@ class RawMonitor:
                 raise c.WinError(c.get_last_error())
             self.registered.add((page, usage))
         self._apply_mouse()
+        # The same timer id replaces the previous one: 30 s once a receiver is registered.
+        user32.SetTimer(self.hwnd, 1, FALLBACK_SCAN_MS if self.registered else EMPTY_SCAN_MS, None)
         if self.devices_callback:
             self.devices_callback(current)
 
@@ -266,7 +284,6 @@ class RawMonitor:
             if not self.hwnd:
                 raise c.WinError(c.get_last_error())
             self._register()
-            user32.SetTimer(self.hwnd, 1, FALLBACK_SCAN_MS, None)
             self.ready.set()
             message = w.MSG()
             while user32.GetMessageW(c.byref(message), None, 0, 0) > 0:

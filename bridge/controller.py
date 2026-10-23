@@ -41,6 +41,9 @@ MIC_OFF_NOTICE = "这一下只关掉了笔上开着的麦克风（点声当时�
 # The press that switched the pen microphone on was the setup wizard's key test (step 1):
 # nothing was lost, the latch is simply still on. This press switched it off.
 TESTED_MIC_OFF_NOTICE = "这一下关掉了配置向导测试按键时打开的笔麦克风；再按一次 ⑥ 开始录音"
+# The same firmware latch on ⑦ (7a = microphone on, 7b = off) for quick notes.
+QUICK_MIC_OFF_NOTICE = "这一下只关掉了笔上开着的麦克风（当时没在录闪念笔记，可能是开始信号丢了）；再短按一次 ⑦ 开始"
+QUICK_TESTED_MIC_OFF_NOTICE = "这一下关掉了配置向导测试按键时打开的笔麦克风；再短按一次 ⑦ 记闪念笔记"
 # Where backend live text comes from: OpenLess, or a built-in cloud engine (bridge.engines).
 PARTIAL_SOURCES = ('remote', 'cloud')
 # The hotkey bridge drives another dictation app that types into the focused field itself.
@@ -54,7 +57,9 @@ METER_EVERY = 0.1
 NOT_TYPED_MESSAGE = "文字没能输入到管理员权限窗口，已保留在本次结果里"
 # A built-in cloud engine reached its input limit: it has the text so far, so the recording
 # ends and that text is typed (OpenLess / another app: still cancelled, see _run).
-CLOUD_LIMIT_NOTICE = "录音已满 {minutes} 分钟，已自动结束并输入识别出的文字"
+CLOUD_LIMIT_NOTICE = "录音已满 {minutes} 分钟，正在结束并识别，完成后输入文字"
+# Said before recognition runs: the result (or note_saved / note_error) reports the outcome.
+NOTE_LIMIT_NOTICE = "笔记录音已满 {minutes} 分钟，正在结束并识别，完成后保存"
 
 
 def backend_label(backend):
@@ -389,6 +394,7 @@ class Controller:
         self.capture_target = self.session_receiver = None
 
     def _pv60_button(self, down):
+        self.notify('key', 'start' if down else 'stop')  # setup wizard step 1 shows the press
         if self.phase not in ('idle', 'recording', 'starting'):
             return
         if self.mode == 'toggle':
@@ -505,6 +511,11 @@ class Controller:
 
     def _arm(self):
         self.last_retry = time.monotonic()
+        if self.capture is not None:
+            # A capture whose close timed out (its WinMM thread was still in waveInReset): release
+            # it first; a second one is never opened beside it.
+            self.capture.close()
+            self.capture = None
         if self.hardware:
             # A timed-out HID close must not be replaced by a second worker.
             self.hardware.close()
@@ -635,8 +646,12 @@ class Controller:
             if latch:
                 self.latch_unused(receiver)
             return
-        if self.closing.is_set() or self.abort.is_set() or self.overflow.is_set():
+        if self.closing.is_set() or self.overflow.is_set():
             raise RuntimeError("录音启动已取消")
+        if self.abort.is_set():
+            # 取消本段 / 暂停 during the wait: its queued command ends this press (no error,
+            # and 取消 re-arms at once). Only close() still fails it, above.
+            return
         self.session_id = uuid.uuid4().hex
         self.remote_text = ''
         self._diagnose('begin', {'session': self.session_id, 'engine': self._label(), 'device': self.device,
@@ -644,7 +659,7 @@ class Controller:
                                  'whisper_mode': self.dsp.mode, 'test': self.session_test})
         for pcm in initial:
             if self.abort.is_set():
-                raise RuntimeError('录音启动已取消')
+                return  # as above: the queued 取消 / 暂停 finishes this press
             self._feed(pcm)
         self.recording_at = time.monotonic()
         self._state("recording", "正在录音；松开长按或再次短按结束")
@@ -763,7 +778,8 @@ class Controller:
                             self.note_category = category if category in ('idea', 'paper') else 'idea'
                             completion.set_result(destination)
                     elif action == "arm":
-                        if self.want_armed and self.capture is None:
+                        # 'error' with a capture still held: its close failed; _arm retries it.
+                        if self.want_armed and (self.capture is None or self.phase == 'error'):
                             self._arm()
                     elif action == "disarm":
                         try:
@@ -802,6 +818,12 @@ class Controller:
                         hint = self.latch_hint(data)
                         if self.phase == "idle" and hint:
                             self.notify("mic_off", TESTED_MIC_OFF_NOTICE if hint == 'tested' else MIC_OFF_NOTICE)
+                    elif action == "quick_off":
+                        # ⑦'s 7b, after any 7a still queued: idle now means its start was lost.
+                        hint = self.latch_hint(data)
+                        if self.phase == "idle" and hint:
+                            self.notify("mic_off", QUICK_TESTED_MIC_OFF_NOTICE if hint == 'tested'
+                                        else QUICK_MIC_OFF_NOTICE)
                     elif action == "cancel":
                         self._disconnect()
                         self.last_retry = 0
@@ -842,12 +864,19 @@ class Controller:
                             # report lost at range used to throw the whole note away. A cloud
                             # engine has ten minutes of text: typing it beats losing it.
                             self.stop_at = now
-                            self.notify("notice", f"笔记录音已满 {limit // 60} 分钟，已自动结束并保存" if notes
-                                        else CLOUD_LIMIT_NOTICE.format(minutes=int(limit // 60)))
+                            self.notify("notice", (NOTE_LIMIT_NOTICE if notes else CLOUD_LIMIT_NOTICE)
+                                        .format(minutes=int(limit // 60)))
                     if self.processing_at and now - self.processing_at > 120:
                         raise RuntimeError("识别超过两分钟未完成，已请求取消；不会重放音频")
-                    if self.want_armed and not self.capture and now - self.last_retry >= 5:
+                    if (self.want_armed and (not self.capture or self.phase == 'error')
+                            and now - self.last_retry >= 5):
                         self._arm()
+                    elif (not self.want_armed and self.phase == 'error' and (self.capture or self.hardware)
+                            and now - self.last_retry >= 5):
+                        # A pause whose release timed out: finish it once the device lets go.
+                        self.last_retry = now
+                        self._disconnect()
+                        self._state("disconnected", "已暂停，麦克风已释放")
                     if self.capture:
                         event = self.backend.poll()
                         if event:
@@ -917,7 +946,8 @@ class Controller:
             self._state("idle", "笔记已保存；按笔继续记录下一段" if self.session_destination == 'notes'
                         else handed_to(app) if app
                         else "试说完成；文字没有输入到光标处" if self.session_test
-                        else NOT_TYPED_MESSAGE if not_typed
+                        else NOT_TYPED_MESSAGE if not_typed == 'elevated'
+                        else "文字没能输入，已保留在本次结果里" if not_typed
                         else "本段已完成；请核对目标编辑框中的文字")
         elif event.get("type") == "partial":
             self._remote_partial(event)

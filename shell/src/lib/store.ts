@@ -37,6 +37,8 @@ interface Store {
   version: string;
   coreDown: string | null;
   state: CoreState;
+  /** When state.phase last changed (ms): the voice page's timers survive page switches. */
+  phaseAt: number;
   mode: Mode;
   pendingMode: Mode | null;
   tool: Tool;
@@ -91,11 +93,17 @@ export const OPENLESS_ENGINE: EngineInfo = { kind: 'openless', label: 'OpenLess'
 
 let noticeId = 0;
 
+/** A repeated phase (whisper boosting began mid-recording) keeps its start time. */
+function phaseAt(s: Pick<Store, 'state' | 'phaseAt'>, next: CoreState) {
+  return next.phase === s.state.phase ? s.phaseAt : Date.now();
+}
+
 export const useStore = create<Store>((set, get) => ({
   ready: false,
   version: '',
   coreDown: null,
   state: { phase: 'disconnected', message: '' },
+  phaseAt: Date.now(),
   mode: 'input',
   pendingMode: null,
   tool: 'mouse',
@@ -156,7 +164,7 @@ export const useStore = create<Store>((set, get) => ({
       const data = await call<{ items: Note[]; tags: string[]; warning: string }>('notes');
       set({ notes: data.items, tags: data.tags ?? [], notesWarning: data.warning });
     } catch (error) {
-      get().notify(String((error as Error).message), 'error');
+      get().notify((error as Error)?.message || '笔记列表未能刷新，请重试。', 'error');
     }
   },
   async renameInstance(id, label) {
@@ -175,6 +183,7 @@ export const useStore = create<Store>((set, get) => ({
       coreDown: null,
       version: s.version,
       state: s.state,
+      phaseAt: phaseAt(get(), s.state),
       mode: s.destination,
       pendingMode: s.pending_mode,
       tool: s.tool ?? 'mouse',
@@ -199,7 +208,11 @@ export const useStore = create<Store>((set, get) => ({
   },
 }));
 
+/* Events that arrived while connectCore's snapshot was in flight. */
+let inFlight: Set<string> | null = null;
+
 function handle(event: string, data: any) {
+  inFlight?.add(event);
   const store = useStore.getState();
   switch (event) {
     case 'ready':
@@ -208,6 +221,7 @@ function handle(event: string, data: any) {
     case 'state':
       useStore.setState((s) => ({
         state: data,
+        phaseAt: phaseAt(s, data),
         // A new recording starts with an empty live transcript.
         liveText: data.phase === 'starting' ? '' : s.liveText,
         liveSource: data.phase === 'starting' ? null : s.liveSource,
@@ -236,7 +250,10 @@ function handle(event: string, data: any) {
       if (data?.not_typed) {
         // An administrator window dropped the typed text: it is kept (clipboard, this result).
         const text = String(data.text ?? '');
-        store.notify(keptToast(data), 'error', text ? { label: '复制', icon: 'copy', run: () => { call('copy_text', { text }).catch(() => {}); } } : undefined);
+        // The toast closes on click: a failed copy must say so, or the old clipboard gets pasted.
+        store.notify(keptToast(data), 'error', text ? { label: '复制', icon: 'copy', run: () => {
+          call('copy_text', { text }).catch((error) => useStore.getState().notify((error as Error)?.message || '没能复制，请到语音页复制本次文字', 'error'));
+        } } : undefined);
       }
       break;
     case 'elevated':
@@ -300,13 +317,17 @@ function handle(event: string, data: any) {
       useStore.setState((s) => ({ probe: [{ ...data, at: Date.now() }, ...s.probe].slice(0, 40) }));
       break;
     case 'battery_alert':
-      store.notify(`倍思电量 ${data.percent}%，建议充电`, 'error');
+      // With several receivers the core names the pen.
+      store.notify(`${data.label ? `${data.label} ` : '倍思'}电量 ${data.percent}%，建议充电`, 'error');
       break;
-    case 'core_exit':
-      useStore.setState({ coreDown: data.restarting ? '点声核心意外退出，正在自动重启…' : '点声核心已退出' });
+    case 'core_exit': {
+      // Like the tray and the capsule: the last phase is no longer true. The next ready restores it.
+      const text = data?.restarting ? '点声核心意外退出，正在自动重启…' : '点声核心已退出';
+      useStore.setState((s) => ({ coreDown: text, state: { phase: 'error', message: text }, phaseAt: phaseAt(s, { phase: 'error', message: text }), liveFinal: false }));
       break;
+    }
     case 'fatal':
-      useStore.setState({ coreDown: String(data) });
+      useStore.setState((s) => ({ coreDown: String(data), state: { phase: 'error', message: String(data) }, phaseAt: phaseAt(s, { phase: 'error', message: '' }) }));
       break;
   }
 }
@@ -316,12 +337,35 @@ export async function connectCore() {
   if (started) return;
   started = true;
   onCore(handle);
+  const seen = (inFlight = new Set<string>());
+  let snapshot: Snapshot | null = null;
   try {
-    const snapshot = await call<Snapshot>('snapshot');
-    useStore.getState().apply(snapshot);
+    snapshot = await call<Snapshot>('snapshot');
   } catch {
-    const ready = await shell.ready();
-    if (ready) useStore.getState().apply(ready);
+    snapshot = (await shell.ready()) ?? null;
+  } finally {
+    inFlight = null;
+  }
+  if (snapshot) {
+    const now = useStore.getState();
+    now.apply(snapshot);
+    // Events can overtake the snapshot reply: keep what they wrote (as the capsule does).
+    useStore.setState({
+      ...(seen.has('state') ? { state: now.state, phaseAt: now.phaseAt, result: now.result, liveText: now.liveText, liveSource: now.liveSource } : {}),
+      ...(seen.has('result') ? { result: now.result } : {}),
+      ...(seen.has('partial') ? { liveText: now.liveText, liveSource: now.liveSource } : {}),
+      ...(seen.has('mode') ? { mode: now.mode, pendingMode: now.pendingMode, tool: now.tool } : {}),
+      ...(seen.has('tool') ? { tool: now.tool } : {}),
+      ...(seen.has('prefs') ? { prefs: now.prefs } : {}),
+      ...(seen.has('devices') ? { devices: now.devices, selected: now.selected } : {}),
+      ...(seen.has('instances') ? { instances: now.instances } : {}),
+      ...(seen.has('tidepool') ? { tidepool: now.tidepool } : {}),
+      ...(seen.has('usage') ? { usage: now.usage } : {}),
+      ...(seen.has('reminder') ? { reminder: now.reminder } : {}),
+      ...(seen.has('app_update') ? { appUpdate: now.appUpdate } : {}),
+      ...(seen.has('engine') ? { engine: now.engine } : {}),
+      ...(seen.has('core_exit') || seen.has('fatal') ? { coreDown: now.coreDown, state: now.state, phaseAt: now.phaseAt } : {}),
+    });
   }
   useStore.getState().refreshNotes();
 }
@@ -333,6 +377,12 @@ export async function act<T = any>(method: string, params?: Record<string, unkno
     useStore.getState().notify((error as Error).message || '操作未完成，请重试。', 'error');
     return null;
   }
+}
+
+/** Hides the reminder only once the core has dropped it, and only the one that was shown. */
+export async function dismissReminder() {
+  const shown = useStore.getState().reminder;
+  if (await act('dismiss_reminder')) useStore.setState((s) => (s.reminder === shown ? { reminder: null } : {}));
 }
 
 export const MODE_INFO: Record<Mode, { label: string; long: string; hint: string }> = {

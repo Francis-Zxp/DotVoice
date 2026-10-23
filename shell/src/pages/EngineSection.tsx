@@ -60,7 +60,7 @@ export function EngineSection({ prefs }: { prefs: Prefs }) {
           {view === 'dashscope' && <DashscopeForm engine={engine} />}
           {(view === 'volc' || view === 'dashscope') && <PolishForm engine={engine} />}
           {view === 'openless' && <OpenLessPanel status={data.openless} loading={data.loading} onRefresh={data.refresh} />}
-          {view === 'hotkey' && <HotkeyForm engine={engine} detect={data.hotkeys} />}
+          {view === 'hotkey' && <HotkeyForm engine={engine} detect={data.hotkeys} loading={data.loading} failed={data.failed} onRetry={data.refresh} />}
         </motion.div>
       </AnimatePresence>
     </Glass>
@@ -354,7 +354,7 @@ function OpenLessPanel({ status, loading, onRefresh }: { status: OpenLessStatus 
               {remote ? `远程输入已开启${status.port ? ` · 端口 ${status.port}` : ''}` : status.remote_input === false ? '远程输入已关闭' : '远程输入未配对'}
             </StatusDot>
           </>
-        ) : <span className="faint text-[12.5px]">正在检查 OpenLess…</span>}
+        ) : <span className="faint text-[12.5px]">{loading ? '正在检查 OpenLess…' : '暂时无法检查 OpenLess，请点“刷新”重试'}</span>}
         <button className="btn btn-ghost btn-sm ml-auto" onClick={onRefresh} disabled={loading}>
           <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />刷新
         </button>
@@ -375,7 +375,9 @@ function OpenLessPanel({ status, loading, onRefresh }: { status: OpenLessStatus 
   );
 }
 
-function HotkeyForm({ engine, detect }: { engine: EnginePrefs; detect: HotkeyDetect | null }) {
+function HotkeyForm({ engine, detect, loading, failed, onRetry }: {
+  engine: EnginePrefs; detect: HotkeyDetect | null; loading: boolean; failed: boolean; onRetry: () => void;
+}) {
   const conf = engine.hotkey;
   const apps = detect?.apps ?? [];
   const [pendingCustom, setPendingCustom] = useState(false);
@@ -400,9 +402,15 @@ function HotkeyForm({ engine, detect }: { engine: EnginePrefs; detect: HotkeyDet
       <div className="setting-row block">
         <div className="title-sm">听写软件</div>
         <p className="muted mt-1 text-[12.5px]">检测到的排在前面。按 ⑥ 时点声替你按下它的快捷键，松开时再按一次（或松开）。</p>
-        {!detect ? (
+        {!detect && loading ? (
           <p className="faint mt-3 flex items-center gap-2 text-[12.5px]"><RefreshCw size={13} className="animate-spin" />正在检测这台电脑上的听写软件…</p>
         ) : (
+          <>
+          {/* A failed detection still offers 自定义快捷键, and a retry. */}
+          {failed && !detect && (
+            <p className="faint mt-3 flex items-center gap-2 text-[12.5px]" data-detect-failed>检测失败，暂时列不出这台电脑上的听写软件。
+              <button className="btn btn-ghost btn-sm" onClick={onRetry}><RefreshCw size={13} />重试</button></p>
+          )}
           <div className="app-grid mt-3">
             {[...apps, null].map((item) => {
               const id = item?.profile ?? 'custom';
@@ -418,6 +426,7 @@ function HotkeyForm({ engine, detect }: { engine: EnginePrefs; detect: HotkeyDet
               );
             })}
           </div>
+          </>
         )}
       </div>
       {(app || selected === 'custom') && (

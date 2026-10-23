@@ -81,7 +81,7 @@ class LocalAsrRemovalTests(CoreLiveTextCase):
         self.assertEqual(local_imports, [])
         prefs = core.prefs.snapshot()
         self.assertNotIn('preview', prefs)
-        self.assertEqual(prefs['voice'], {'whisper': 'off'})
+        self.assertEqual(prefs['voice'], {'whisper': 'off', 'armed': False})
         self.assertEqual(prefs['appearance']['theme'], 'glass')
         self.assertEqual(prefs['overlay']['position'], {'x': -120, 'y': 45})
         self.assertEqual(prefs['overlay']['monitor'], 'panel')
@@ -95,7 +95,7 @@ class LocalAsrRemovalTests(CoreLiveTextCase):
         core = self.core()
         for patch_value in ({'voice': {'fast_raw': True}}, {'preview': {'show_local_text': True}}):
             self.assertIn('error', core.prefs_set(patch_value))
-        self.assertEqual(core.prefs.get('voice'), {'whisper': 'auto'})
+        self.assertEqual(core.prefs.get('voice'), {'whisper': 'auto', 'armed': False})
 
 
 class PartialSourceTests(CoreLiveTextCase):
@@ -176,7 +176,7 @@ class LiveTextPrefsTests(unittest.TestCase):
             prefs = Preferences(path)
             self.assertEqual(prefs.warning, '')
             self.assertNotIn('preview', prefs.snapshot())
-            self.assertEqual(prefs.get('voice'), {'whisper': 'on'})
+            self.assertEqual(prefs.get('voice'), {'whisper': 'on', 'armed': False})
             self.assertFalse(prefs.get('sounds', 'enabled'))
             self.assertEqual(prefs.get('sounds', 'volume'), 'medium')
 
@@ -187,7 +187,7 @@ class LiveTextPrefsTests(unittest.TestCase):
             prefs = Preferences(path)
             self.assertTrue(prefs.warning)
             self.assertEqual(prefs.path.name, 'prefs-recovered.json')
-            self.assertEqual(prefs.get('voice'), {'whisper': 'auto'})
+            self.assertEqual(prefs.get('voice'), {'whisper': 'auto', 'armed': False})
             self.assertNotIn('preview', prefs.snapshot())
 
 

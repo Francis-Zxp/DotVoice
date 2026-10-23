@@ -1,6 +1,6 @@
 [package]
 name = "dotvoice"
-version = "0.11.6"
+version = "0.11.8"
 description = "点声 DotVoice desktop shell"
 edition = "2021"
 publish = false
@@ -33,6 +33,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# tauri::test (a mock runtime) for unit tests; no extra crates.
+tauri = { version = "2", features = ["test"] }
 
 [profile.release]
 codegen-units = 1

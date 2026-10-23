@@ -101,6 +101,17 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+/// A new core.log for the core's stderr. What the last core wrote (a crash it was restarted
+/// after) is kept as core.prev.log; an empty log does not replace an earlier diagnosis.
+/// The rename works while an old core still holds the file (Rust opens with FILE_SHARE_DELETE).
+fn fresh_log(runtime: &Path) -> std::io::Result<File> {
+    let log = runtime.join("core.log");
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > 0) {
+        let _ = std::fs::rename(&log, runtime.join("core.prev.log"));
+    }
+    File::create(log)
+}
+
 fn core_command(smoke: bool) -> Command {
     let data = data_dir();
     let mut command = if let Ok(custom) = std::env::var("DOTVOICE_CORE") {
@@ -152,9 +163,7 @@ impl CoreClient {
         let mut command = core_command(self.smoke);
         let runtime = data_dir().join("runtime");
         let _ = std::fs::create_dir_all(&runtime);
-        let stderr = File::create(runtime.join("core.log"))
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
+        let stderr = fresh_log(&runtime).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -319,8 +328,30 @@ impl CoreClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_line, take_if_current, Line};
+    use super::{fresh_log, parse_line, take_if_current, Line};
     use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn a_restart_keeps_the_crashed_cores_log() {
+        // A fixed folder, reused by every run (whatever an earlier run left is replaced).
+        let runtime = std::env::temp_dir().join("dotvoice-core-log-test");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("core.log"), b"").unwrap();
+        std::fs::write(runtime.join("core.prev.log"), b"an older run").unwrap();
+        let read = |name: &str| std::fs::read_to_string(runtime.join(name)).unwrap();
+        // The dead core's handle may still be open (and written to) when the restart comes.
+        let mut first = fresh_log(&runtime).unwrap();
+        first.write_all(b"Traceback: worker died").unwrap();
+        let second = fresh_log(&runtime).unwrap();
+        assert_eq!(read("core.prev.log"), "Traceback: worker died");
+        assert_eq!(read("core.log"), "");
+        // A core that wrote nothing does not wipe the earlier diagnosis.
+        drop((first, second));
+        drop(fresh_log(&runtime).unwrap());
+        assert_eq!(read("core.prev.log"), "Traceback: worker died");
+        assert_eq!(read("core.log"), "");
+    }
 
     #[test]
     fn a_replaced_cores_reader_leaves_the_running_core_alone() {

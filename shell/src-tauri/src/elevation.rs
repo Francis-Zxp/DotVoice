@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, HANDLE, HWND, WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
+use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_OEMCP};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TokenElevationType, TokenElevationTypeLimited, TokenUser,
@@ -249,6 +249,18 @@ pub fn classify(xml: Option<&str>, exe: &Path) -> TaskState {
         None => TaskState::Missing,
         Some(command) if same_path(&command, exe) => TaskState::Ours,
         Some(command) => TaskState::Other(command),
+    }
+}
+
+/// As [`classify`], for a query printed through a code page that turns what it cannot show
+/// into '?' (an English system, a Chinese user name): `lossy` makes the same trip with this
+/// exe's path. '?' is never part of a real path.
+pub fn classify_printed(xml: Option<&str>, exe: &Path, lossy: impl Fn(&str) -> String) -> TaskState {
+    match classify(xml, exe) {
+        TaskState::Other(command) if command.contains('?') && same_path(&command, Path::new(&lossy(&exe.to_string_lossy()))) => {
+            TaskState::Ours
+        }
+        state => state,
     }
 }
 
@@ -478,6 +490,23 @@ fn decode_oem(bytes: &[u8]) -> String {
     }
 }
 
+/// `text` after a trip through the OEM code page, as schtasks prints it.
+fn oem_lossy(text: &str) -> String {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    if units.is_empty() || units.len() > i32::MAX as usize {
+        return text.to_string();
+    }
+    unsafe {
+        let len = WideCharToMultiByte(CP_OEMCP, 0, units.as_ptr(), units.len() as i32, null_mut(), 0, null(), null_mut());
+        if len <= 0 {
+            return text.to_string();
+        }
+        let mut bytes = vec![0u8; len as usize];
+        WideCharToMultiByte(CP_OEMCP, 0, units.as_ptr(), units.len() as i32, bytes.as_mut_ptr(), len, null(), null_mut());
+        decode_oem(&bytes)
+    }
+}
+
 pub fn exe() -> Option<PathBuf> {
     std::env::current_exe().ok()
 }
@@ -487,7 +516,7 @@ pub fn query_task() -> TaskState {
     let Some(exe) = exe() else { return TaskState::Missing };
     let output = schtasks().args(["/Query", "/TN", TASK_NAME, "/XML"]).stdout(Stdio::piped()).output();
     match output {
-        Ok(out) if out.status.success() => classify(Some(&decode_oem(&out.stdout)), &exe),
+        Ok(out) if out.status.success() => classify_printed(Some(&decode_oem(&out.stdout)), &exe, oem_lossy),
         _ => TaskState::Missing,
     }
 }
@@ -858,6 +887,25 @@ mod tests {
         assert_eq!(classify(Some(&moved), exe), TaskState::Other(r"D:\Portable\DotVoice/DOTVOICE.EXE".into()));
         assert_eq!(classify(None, exe), TaskState::Missing);
         assert_eq!(classify(Some("<Task><Command></Command></Task>"), exe), TaskState::Missing);
+    }
+
+    #[test]
+    fn a_task_printed_through_a_lossy_code_page_is_still_ours() {
+        // An English system (OEM 437) prints a Chinese user name as '?'.
+        let lossy = |s: &str| s.chars().map(|c| if c.is_ascii() { c } else { '?' }).collect::<String>();
+        let exe = Path::new(r"C:\Users\张三\AppData\Local\Programs\DotVoice\DotVoice.exe");
+        let printed = lossy(&task_xml(exe, SID));
+        let seen = r"C:\Users\??\AppData\Local\Programs\DotVoice\DotVoice.exe";
+        assert_eq!(classify(Some(&printed), exe), TaskState::Other(seen.into()));
+        assert_eq!(classify_printed(Some(&printed), exe, lossy), TaskState::Ours);
+        // Another copy stays another copy, '?' or not.
+        assert_eq!(classify_printed(Some(&printed), Path::new(r"D:\点声\DotVoice.exe"), lossy), TaskState::Other(seen.into()));
+        let moved = lossy(&task_xml(Path::new(r"D:\Portable\DotVoice.exe"), SID));
+        assert_eq!(classify_printed(Some(&moved), exe, lossy), TaskState::Other(r"D:\Portable\DotVoice.exe".into()));
+        assert_eq!(classify_printed(None, exe, lossy), TaskState::Missing);
+        // The real trip leaves an ASCII path as it is, in any OEM code page.
+        let plain = r"C:\Program Files\DotVoice\DotVoice.exe";
+        assert_eq!(oem_lossy(plain), plain);
     }
 
     #[test]

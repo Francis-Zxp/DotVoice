@@ -4,7 +4,7 @@ use serde_json::json;
 use std::sync::Mutex;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Manager, Runtime, Wry};
 
 use crate::core_client::CoreClient;
 use std::sync::Arc;
@@ -12,12 +12,39 @@ use std::sync::Arc;
 const ONLINE: &[u8] = include_bytes!("../icons/status-online.ico");
 const OFFLINE: &[u8] = include_bytes!("../icons/status-offline.ico");
 
-pub struct TrayHandles {
-    open: MenuItem<Wry>,
-    arm: MenuItem<Wry>,
-    mode_input: CheckMenuItem<Wry>,
-    mode_notes: CheckMenuItem<Wry>,
+pub struct TrayHandles<R: Runtime = Wry> {
+    open: MenuItem<R>,
+    arm: MenuItem<R>,
+    mode_input: CheckMenuItem<R>,
+    mode_notes: CheckMenuItem<R>,
     last: Mutex<(String, bool)>,
+}
+
+impl<R: Runtime> TrayHandles<R> {
+    /// The items that ask the core for something start disabled, until its first 'ready'.
+    fn new(app: &AppHandle<R>) -> tauri::Result<Self> {
+        Ok(Self {
+            open: MenuItem::with_id(app, "open", "打开点声", true, None::<&str>)?,
+            arm: MenuItem::with_id(app, "arm", "启用语音输入", false, None::<&str>)?,
+            mode_input: CheckMenuItem::with_id(app, "mode_input", "输入到光标", false, true, None::<&str>)?,
+            mode_notes: CheckMenuItem::with_id(app, "mode_notes", "留作笔记", false, false, None::<&str>)?,
+            last: unreported(),
+        })
+    }
+
+    /// While the core is down nothing would act on these, and muda would still flip a mode's
+    /// check mark on click with no 'mode' event to put it back.
+    fn set_core_available(&self, up: bool) {
+        let _ = self.arm.set_enabled(up);
+        let _ = self.mode_input.set_enabled(up);
+        let _ = self.mode_notes.set_enabled(up);
+    }
+}
+
+pub fn set_core_available(app: &AppHandle, up: bool) {
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        handles.set_core_available(up);
+    }
 }
 
 pub fn phase_label(phase: &str) -> &'static str {
@@ -32,19 +59,16 @@ pub fn phase_label(phase: &str) -> &'static str {
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开点声", true, None::<&str>)?;
-    let arm = MenuItem::with_id(app, "arm", "启用语音输入", true, None::<&str>)?;
-    let mode_input = CheckMenuItem::with_id(app, "mode_input", "输入到光标", true, true, None::<&str>)?;
-    let mode_notes = CheckMenuItem::with_id(app, "mode_notes", "留作笔记", true, false, None::<&str>)?;
+    let handles = TrayHandles::new(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出点声", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
-            &open,
-            &arm,
+            &handles.open,
+            &handles.arm,
             &PredefinedMenuItem::separator(app)?,
-            &mode_input,
-            &mode_notes,
+            &handles.mode_input,
+            &handles.mode_notes,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -79,13 +103,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .build(app)?;
-    app.manage(TrayHandles {
-        open,
-        arm,
-        mode_input,
-        mode_notes,
-        last: unreported(),
-    });
+    app.manage(handles);
     Ok(())
 }
 
@@ -141,7 +159,22 @@ pub fn update_mode(app: &AppHandle, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{record, unreported};
+    use super::{record, unreported, TrayHandles};
+
+    #[test]
+    fn core_actions_are_disabled_until_ready_and_again_after_the_core_exits() {
+        let app = tauri::test::mock_app();
+        let handles = TrayHandles::new(app.handle()).unwrap();
+        let enabled = |h: &TrayHandles<_>| {
+            [h.arm.is_enabled(), h.mode_input.is_enabled(), h.mode_notes.is_enabled()].map(|e| e.unwrap())
+        };
+        assert_eq!(enabled(&handles), [false; 3], "no core yet");
+        assert!(handles.open.is_enabled().unwrap(), "the window opens without a core");
+        handles.set_core_available(true);
+        assert_eq!(enabled(&handles), [true; 3]);
+        handles.set_core_available(false);
+        assert_eq!(enabled(&handles), [false; 3], "core_exit: no silent clicks, no stray check marks");
+    }
 
     #[test]
     fn the_first_report_is_applied_even_when_it_is_disconnected_and_paused() {

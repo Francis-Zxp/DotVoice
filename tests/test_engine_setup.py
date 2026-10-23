@@ -322,7 +322,7 @@ class EngineSwapTests(TempCase):
         control.disarm_and_wait = stuck
         answer = core.prefs_set({'engine': {'kind': 'volc'}})
         self.assertIn('翻页笔尚未完全释放', answer['error'])
-        self.assertIn('已恢复', answer['error'])
+        self.assertIn('正在恢复', answer['error'])  # the re-arm's own state events say whether it worked
         self.assertIs(control.backend, openless, 'the engine did not change')
         self.assertEqual(core.prefs.get('engine', 'kind'), 'openless')
         self.assertIn('close', self.built[-1][1].calls, 'the unused engine is let go')

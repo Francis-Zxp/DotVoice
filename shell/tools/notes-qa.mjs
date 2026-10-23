@@ -63,6 +63,28 @@ try {
     assert.equal(await page.locator('[data-note-detail]').getAttribute('data-note-detail'), id);
     assert.equal(await page.getByRole('textbox', { name: '编辑整理稿' }).inputValue(), '尚未保存的修改');
   });
+  await check('a tag change that leaves the filter keeps the note and its draft open', async (page) => {
+    await page.getByRole('group', { name: '按标签筛选' }).getByRole('button', { name: /收件箱/ }).click();
+    await page.waitForFunction(() => {
+      const items = document.querySelectorAll('[data-note-id]');
+      const details = document.querySelectorAll('[data-note-detail]');
+      return items.length === 1 && details.length === 1 && details[0].getAttribute('data-note-detail') === items[0].getAttribute('data-note-id');
+    });
+    const id = await page.locator('[data-note-detail]').getAttribute('data-note-detail');
+    await page.getByRole('button', { name: '编辑', exact: true }).click();
+    await page.getByRole('textbox', { name: '编辑整理稿' }).fill('还没保存的整理稿');
+    await page.getByRole('button', { name: '标签', exact: true }).click();
+    await page.getByPlaceholder('标签名').fill('待办');
+    await page.getByPlaceholder('标签名').press('Enter');
+    await page.getByRole('button', { name: '移除标签 待办', exact: true }).waitFor();
+    await page.waitForTimeout(250);
+    assert.equal(await page.locator('[data-note-id]').count(), 0);
+    assert.equal(await page.locator('[data-note-detail]').getAttribute('data-note-detail'), id);
+    assert.equal(await page.getByRole('textbox', { name: '编辑整理稿' }).inputValue(), '还没保存的整理稿');
+    await page.getByRole('button', { name: '保存修改', exact: true }).click();
+    await page.waitForFunction(() => window.__notesQA.calls.some(c => c.method === 'update_note'));
+    assert.equal(await page.evaluate((note) => window.__notesQA.notes.find(n => n.id === note).text, id), '还没保存的整理稿');
+  });
   await check('copy while editing copies the visible draft', async (page) => {
     await page.getByRole('button', { name: '编辑', exact: true }).click();
     await page.getByRole('textbox', { name: '编辑整理稿' }).fill('正在修改的草稿');

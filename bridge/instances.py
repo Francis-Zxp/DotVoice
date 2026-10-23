@@ -28,7 +28,51 @@ IDENTITIES = {model: profile['identity'] for model, profile in PROFILES.items()}
 MAX_KNOWN = 16          # absent receivers kept for their names; oldest dropped first
 LABEL_MAX = 24
 RETRY_UNMAPPED = 5.0    # a node that is still starting is looked up again later
+READ_RETRY = .25        # another program (antivirus, backup) briefly holding instances.json
 _CONTROL = re.compile(r'[\x00-\x1f\x7f]')
+
+
+def _read(path):
+    """The receiver list of an instances file. A file another program holds open (Windows
+    sharing violation) is tried once more; a file of the wrong shape raises ValueError."""
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        time.sleep(READ_RETRY)
+        text = path.read_text(encoding='utf-8')
+    saved = json.loads(text)
+    items = saved.get('instances', []) if isinstance(saved, dict) else None
+    if not isinstance(items, list):
+        raise ValueError('instances')
+    return items
+
+
+def _stamp(mtime, form='%Y-%m-%d %H:%M'):
+    return time.strftime(form, time.localtime(mtime))
+
+
+def _records(items):
+    """id -> record for the valid receivers of a saved list; anything else is skipped."""
+    records = {}
+    for item in items:
+        try:
+            model = item['model']
+            record = {'id': str(item['id']), 'model': model, 'seq': int(item['seq']),
+                      'label': (item.get('label') or None) if isinstance(item.get('label'), str) else None,
+                      'parent': item.get('parent') if isinstance(item.get('parent'), str) else None,
+                      'first_seen': float(item.get('first_seen') or 0),
+                      'last_seen': float(item.get('last_seen') or 0),
+                      'last_used': float(item['last_used']) if item.get('last_used') is not None else None,
+                      'battery': None}
+            battery = item.get('battery')
+            if isinstance(battery, dict) and type(battery.get('percent')) is int:
+                record['battery'] = {'percent': battery['percent'],
+                                     'reported_at': float(battery.get('reported_at') or 0)}
+            if model in MODEL_LABELS and record['seq'] > 0:
+                records[record['id']] = record
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return records
 
 
 def model_of(path):
@@ -167,49 +211,94 @@ class InstanceRegistry:
         self.active = None
         self.warning = ''
         self._load()
+        self.notice = self.warning  # about the file itself: stays for the session
 
     # -- persistence ------------------------------------------------------------
     def _load(self):
         if not self.path.exists():
             return
+        recovered = self.path.with_name(self.path.stem + '-recovered.json')
         try:
-            saved = json.loads(self.path.read_text(encoding='utf-8'))
-            items = saved.get('instances', []) if isinstance(saved, dict) else []
-        except (OSError, ValueError):
-            self.warning = '设备名称记录无法读取，已重新开始编号。'
+            items = _read(self.path)
+        except (OSError, ValueError) as error:
+            # The original is kept as it is (never replaced by a fresh numbering). Names and
+            # numbers go to <name>-recovered.json, read back while the original stays unreadable.
+            problem = '被其它程序占用，暂时无法读取' if isinstance(error, OSError) else '已损坏，无法读取'
+            items, saved = [], None
+            if recovered.exists():
+                try:
+                    saved = _stamp(recovered.stat().st_mtime)
+                    items = _read(recovered)
+                except (OSError, ValueError):
+                    items, saved = [], None
+            using = f'正在使用 {saved} 另存的记录' if saved else '本次重新编号'
+            self.warning = (f'设备名称记录 {self.path.name} {problem}：{using}；原文件保留，'
+                            f'名称与编号保存到 {recovered.name}。')
+            self.path = recovered
+            self.known = _records(items)
             return
-        for item in items:
+        self.known = _records(items)
+        if recovered.exists():
+            self._take_recovered(recovered)
+
+    def _take_recovered(self, recovered):
+        """The original reads again, but earlier sessions kept names and numbers in the recovered
+        file (the original was unreadable then, so they numbered afresh). Merged by receiver: a
+        name given then, the newest battery and use; a receiver only seen then gets the next free
+        number. The copy is then renamed, never deleted: it cannot come back later."""
+        try:
+            mtime = recovered.stat().st_mtime
             try:
-                model = item['model']
-                record = {'id': str(item['id']), 'model': model, 'seq': int(item['seq']),
-                          'label': (item.get('label') or None) if isinstance(item.get('label'), str) else None,
-                          'parent': item.get('parent') if isinstance(item.get('parent'), str) else None,
-                          'first_seen': float(item.get('first_seen') or 0),
-                          'last_seen': float(item.get('last_seen') or 0),
-                          'last_used': float(item['last_used']) if item.get('last_used') is not None else None,
-                          'battery': None}
-                battery = item.get('battery')
-                if isinstance(battery, dict) and type(battery.get('percent')) is int:
-                    record['battery'] = {'percent': battery['percent'],
-                                         'reported_at': float(battery.get('reported_at') or 0)}
-                if model in MODEL_LABELS and record['seq'] > 0:
-                    self.known[record['id']] = record
-            except (KeyError, TypeError, ValueError):
+                records = _records(_read(recovered))
+            except ValueError:
+                records = None
+            else:
+                self._merge(records)
+                self._write()  # idempotent: if the rename below fails, the next start merges again
+            kept = recovered.with_name(f'{recovered.stem}-{_stamp(mtime, "%Y%m%d-%H%M%S")}.json')
+            recovered.rename(kept)  # Windows: never over another kept copy
+        except OSError:
+            return  # still there: looked at again at the next start
+        self.warning = ((f'已并入 {_stamp(mtime)} 另存的设备名称记录（当时 {self.path.name} 无法读取）'
+                         if records is not None else
+                         f'{_stamp(mtime)} 另存的设备名称记录 {recovered.name} 无法读取，未并入')
+                        + f'；该副本已改名为 {kept.name} 保留。')
+
+    def _merge(self, records):
+        for record in sorted(records.values(), key=lambda r: (r['model'], r['seq'])):
+            old = self.known.get(record['id'])
+            if old is None:
+                seq = 1 + max((r['seq'] for r in self.known.values() if r['model'] == record['model']), default=0)
+                self.known[record['id']] = {**record, 'seq': seq}
                 continue
+            old['label'] = record['label'] or old['label']
+            old['parent'] = record['parent'] or old['parent']
+            old['last_seen'] = max(old['last_seen'], record['last_seen'])
+            if record['last_used'] is not None and record['last_used'] > (old['last_used'] or 0):
+                old['last_used'] = record['last_used']
+            if record['battery'] and (old['battery'] is None
+                                      or record['battery']['reported_at'] >= old['battery']['reported_at']):
+                old['battery'] = record['battery']
+        self._prune(set())
+
+    def _write(self):
+        with self.lock:
+            data = {'version': 1, 'instances': sorted(self.known.values(), key=lambda r: (r['model'], r['seq']))}
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix('.tmp')
+        temp.write_text(text, encoding='utf-8')
+        temp.replace(self.path)
 
     def save(self):
         """Never called with self.lock held (lock order: save_lock, then lock)."""
         with self.save_lock:  # HID, session and RPC threads may all save; the newest wins
-            with self.lock:
-                data = {'version': 1, 'instances': sorted(self.known.values(), key=lambda r: (r['model'], r['seq']))}
-                text = json.dumps(data, ensure_ascii=False, indent=2)
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                temp = self.path.with_suffix('.tmp')
-                temp.write_text(text, encoding='utf-8')
-                temp.replace(self.path)
+                self._write()
             except OSError:
                 self.warning = '设备名称未能保存；重启后可能恢复默认名称。'
+            else:
+                self.warning = self.notice  # a failed save's warning ends with the next one
 
     # -- identity -------------------------------------------------------------------
     def _map(self, path):

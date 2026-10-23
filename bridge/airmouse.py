@@ -432,7 +432,8 @@ class ShortcutGuard:
             return False
         if family == 'f5' and self.presentation_app():
             return False
-        self.tail_until = now + GUARD_TAIL
+        if family == 'f5':
+            self.tail_until = now + GUARD_TAIL  # only ③'s Shift+F5 is followed by a Win tap
         return True
 
     def _paired_letter(self, vk, now):

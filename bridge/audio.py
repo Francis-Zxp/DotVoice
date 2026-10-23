@@ -85,15 +85,24 @@ def find_device(device='baseus', parent=None, tree=None):
              if profile['microphone'].casefold() in name.casefold()]
     if parent:
         from .instances import usb_parent
+        foreign = set()  # inputs mapped to another receiver: never this pen's microphone
         # Same-named inputs first (~5 ms per lookup); a renamed endpoint is still found.
         for group in (named, [item for item in inputs if item not in named]):
             mine = []
             for index, name in group:
                 path = interface_path(index)
-                if path and usb_parent(path, profile['identity'], tree) == parent.upper():
+                owner = usb_parent(path, profile['identity'], tree) if path else None
+                if owner == parent.upper():
                     mine.append((index, name))
+                elif owner:
+                    foreign.add(index)
             if len(mine) == 1:
                 return mine[0]
+        # The by-name fallback is for endpoints that cannot be mapped (a tree lookup that
+        # failed), never for one known to belong to another receiver.
+        if named and all(index in foreign for index, _ in named):
+            raise RuntimeError('这支笔的麦克风尚未就绪；请稍等几秒，或在 Windows 声音设置中启用它后重试')
+        named = [item for item in named if item[0] not in foreign]
     matches = named
     if len(matches) != 1:
         if parent and len(matches) > 1:

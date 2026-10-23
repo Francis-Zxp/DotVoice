@@ -17,12 +17,14 @@ not OpenLess; the class also sets partial_source = 'cloud') and "engine": "volc"
   {"type": "partial", "text": <whole text so far>, "offset": 0, "final": False}
   {"type": "partial", "text": <raw transcript>, "offset": 0, "final": True}
   {"kind": "polishing"}                         only when a polish style is set
-  {"kind": "notice", "message"}                 polish failed / text could not be typed
-                                                (the current controller ignores this kind)
+  {"kind": "notice", "message"}                 polish failed or was not configured
   {"type": "result", "text": <final text>, "raw"?: <transcript before polish>,
-   "not_typed"?: "elevated"}                    the foreground window runs as administrator:
-                                                Windows dropped the keystrokes, the text is
-                                                kept (the core copies it to the clipboard)
+   "not_typed"?: "elevated" | "partial" | "refused"}
+                                                the text did not (fully) reach the window: an
+                                                administrator window dropped the keystrokes,
+                                                Windows refused the rest after some went in, or
+                                                refused them all (lock screen, UAC prompt). The
+                                                text is kept (the core copies it to the clipboard)
   {"kind": "error", "message": <Chinese>}
 """
 from collections import deque
@@ -40,7 +42,12 @@ SECRET_VOLC_ACCESS_TOKEN = 'volc.access_token'
 SECRET_DASHSCOPE_API_KEY = 'dashscope.api_key'
 SECRET_LLM_API_KEY = 'llm.api_key'
 
-ASR_WATCHDOG = 30   # seconds after stop() without a transcript (e.g. DNS hung): give up
+ASR_WATCHDOG = 30   # seconds after stop() while the recogniser has not even connected (e.g. DNS hung): give up
+# Seconds after stop() in all, connected or not (a backlog still uploading on a slow link). Once
+# connected, the session's own timeouts bound each step; this cap leaves time to polish within
+# the controller's two-minute limit.
+ASR_CAP = 90
+POLISH_BY = 100     # seconds after stop(): polish is done by then, or the transcript is used
 # 轻度润色 / 自定义 chosen before the relay's URL, model and key are all filled in: the voice keeps
 # working (the transcript is typed as it is) and each recording says so once.
 POLISH_INCOMPLETE = '润色未配置完整，已按原文输入'
@@ -55,7 +62,7 @@ class _CallablePolish:
     def check(self):
         pass
 
-    def polish(self, text):
+    def polish(self, text, deadline=None):
         return self.function(text)
 
 
@@ -108,7 +115,11 @@ class _Job:
         if raw and polisher is not None and polisher.enabled:
             self._push({'kind': 'polishing'})
             try:
-                text = (polisher.polish(raw) or '').strip()
+                if isinstance(polisher, (Polisher, _CallablePolish)) and self.stopped_at is not None:
+                    text = polisher.polish(raw, deadline=self.stopped_at + POLISH_BY)
+                else:
+                    text = polisher.polish(raw)
+                text = (text or '').strip()
             except PolishError as exc:
                 self._notice(f'{exc}；已改用识别原文')
                 text = raw
@@ -132,11 +143,9 @@ class _Job:
                 except ElevatedTarget:
                     not_typed = 'elevated'  # said once with the result, never lost
                 except PartlyTyped:
-                    self._notice('部分文字没能输入（系统拦截了按键），请检查编辑框')
-                except OSError:
-                    self._notice('文字没能输入（目标可能是管理员权限窗口），请从结果中复制')
-                except Exception as exc:
-                    self._notice(f'文字没能输入（{type(exc).__name__}），请从结果中复制')
+                    not_typed = 'partial'
+                except Exception:   # plain OSError (lock screen, UAC prompt) or a typer bug
+                    not_typed = 'refused'
         result = {'type': 'result', 'text': text}
         if text != raw:
             result['raw'] = raw
@@ -152,7 +161,8 @@ class CloudBackend(VoiceBackend):
     corrector: optional text -> text applied to the final text before it is typed."""
     partial_source = 'cloud'   # Controller._partial_source: live text from a built-in engine
 
-    def __init__(self, asr, polish=None, inserter=type_text, corrector=None, asr_watchdog=ASR_WATCHDOG):
+    def __init__(self, asr, polish=None, inserter=type_text, corrector=None, asr_watchdog=ASR_WATCHDOG,
+                 asr_cap=ASR_CAP):
         self.asr = asr
         if polish is not None and not hasattr(polish, 'polish') and callable(polish):
             polish = _CallablePolish(polish)
@@ -160,6 +170,7 @@ class CloudBackend(VoiceBackend):
         self.inserter = inserter
         self.corrector = corrector
         self.asr_watchdog = asr_watchdog
+        self.asr_cap = asr_cap
         self.insert_text = True
         self.label = getattr(asr, 'name', '云端识别')      # e.g. 豆包语音 / 阿里云百炼, for UI text
         self.engine = getattr(asr, 'source', 'cloud')      # 'volc' / 'dashscope'
@@ -242,11 +253,19 @@ class CloudBackend(VoiceBackend):
 
     def _watchdog(self):
         job = self.job
-        if (job is not None and job.stopped_at is not None and not job.transcribed and not job.finished
-                and time.monotonic() - job.stopped_at > self.asr_watchdog):
-            job.session.cancel()
-            job._push({'kind': 'error', 'message': f'{self.label}超过 {self.asr_watchdog:g} 秒没有返回结果，本段已取消'},
-                      terminal=True)
+        if job is None or job.stopped_at is None or job.transcribed or job.finished:
+            return
+        waited = time.monotonic() - job.stopped_at
+        stats = getattr(job.session, 'stats', None) or {}
+        cap = max(self.asr_watchdog, self.asr_cap)
+        if stats.get('connected') is None and waited > self.asr_watchdog:
+            message = f'{self.label}超过 {self.asr_watchdog:g} 秒没有返回结果，本段已取消'
+        elif waited > cap:
+            message = f'网络太慢，{self.label}在 {cap:g} 秒内没能完成识别，本段已取消'
+        else:
+            return   # connected: still sending a backlog, or the session's own final_timeout runs
+        job.session.cancel()
+        job._push({'kind': 'error', 'message': message}, terminal=True)
 
 
 def create_backend(settings, secret=None, inserter=type_text, corrector=None):

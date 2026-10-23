@@ -161,6 +161,9 @@ class KeepAwake:
         self.buffer = None
         # start/stop/refresh come from the RPC (settings) and ticker threads.
         self.lock = threading.RLock()
+        # Switched on (settings): refresh() retries an open that failed (no output device
+        # yet at boot, a Bluetooth speaker still connecting, the audio service restarting).
+        self.wanted = False
 
     @property
     def running(self):
@@ -168,6 +171,7 @@ class KeepAwake:
 
     def start(self):
         with self.lock:
+            self.wanted = True
             return self._start()
 
     def _start(self):
@@ -218,21 +222,27 @@ class KeepAwake:
         return True
 
     def stop(self):
+        """Switched off (or quitting)."""
         with self.lock:
-            if self.handle is None:
-                return
-            import ctypes as c
-            winmm = self._winmm
-            winmm.waveOutReset(self.handle)
-            winmm.waveOutUnprepareHeader(self.handle, c.byref(self.header), c.sizeof(self.header))
-            winmm.waveOutClose(self.handle)
-            self.handle = self.header = self.buffer = None
+            self.wanted = False
+            self._close()
+
+    def _close(self):
+        if self.handle is None:
+            return
+        import ctypes as c
+        winmm = self._winmm
+        winmm.waveOutReset(self.handle)
+        winmm.waveOutUnprepareHeader(self.handle, c.byref(self.header), c.sizeof(self.header))
+        winmm.waveOutClose(self.handle)
+        self.handle = self.header = self.buffer = None
 
     def refresh(self):
-        """Reopen so the stream follows a changed default output device."""
+        """Reopen so the stream follows a changed default output device; also retries an
+        open that failed, which would otherwise leave cues without the device kept awake."""
         with self.lock:
-            if self.handle is not None:
-                self.stop()
+            if self.wanted:
+                self._close()
                 self._start()
 
 

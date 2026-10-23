@@ -54,7 +54,15 @@ export function elevationView(status: ElevationStatus | null, prefs: Prefs | nul
 /** The capsule chip after an administrator window dropped DotVoice's input. */
 export interface BlockedChip { title: string; hint: string; detail: string }
 
-export function blockedChip(kind: 'elevated' | 'kept', copied = false): BlockedChip {
+export function blockedChip(kind: 'elevated' | 'kept', copied = false, reason: string = 'elevated'): BlockedChip {
+  if (kind === 'kept' && reason !== 'elevated') {
+    // Windows refused the keystrokes (DotVoice may itself be elevated): no administrator window.
+    return {
+      title: '文字没能输入',
+      hint: copied ? '已复制到剪贴板，按 Ctrl+V 粘贴' : '文字保留在点声主窗口的本次结果里',
+      detail: '系统拒绝了模拟输入（可能是锁屏或 UAC 提示）',
+    };
+  }
   if (kind === 'kept') {
     return {
       title: '文字没能输入到管理员窗口',

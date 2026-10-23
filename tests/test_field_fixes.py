@@ -319,7 +319,7 @@ class RecordingLimitTests(unittest.TestCase):
             wait_for(lambda: self.control.phase == 'processing', timeout=3)
         self.assertIn('stop', self.backend.calls)
         self.assertNotIn('cancel', self.backend.calls)
-        self.assertTrue(any(kind == 'notice' and '自动结束并保存' in value for kind, value in self.notifications))
+        self.assertTrue(any(kind == 'notice' and '正在结束并识别，完成后保存' in value for kind, value in self.notifications))
         self.backend.incoming.put({'type': 'result', 'text': '半小时的讲座'})
         wait_for(lambda: self.control.phase == 'idle')
         results = [value for kind, value in self.notifications if kind == 'result']

@@ -1,6 +1,6 @@
-# 点声 DotVoice 0.11.6
+# 点声 DotVoice 0.11.8
 
-胶囊可选择屏幕、九宫格位置，或在所有屏幕同步显示；移除点声本机识别旁路，统一使用所选语音引擎。详见 [0.11.6 更新说明](RELEASE_0.11.6.md)。
+Claude 与 Codex 分区独立审查、相互质询后修复 84 个问题；新增“启动时恢复上次的语音启用状态”。详见 [0.11.8 更新说明](RELEASE_0.11.8.md)；上一版见 [0.11.7](RELEASE_0.11.7.md)。
 
 [下载最新正式版](https://github.com/Francis-Zxp/DotVoice/releases/latest) · [全部版本](https://github.com/Francis-Zxp/DotVoice/releases) · [问题反馈](https://github.com/Francis-Zxp/DotVoice/issues)
 

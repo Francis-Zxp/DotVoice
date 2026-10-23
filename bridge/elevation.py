@@ -34,10 +34,18 @@ NOTICE = f'该窗口以管理员权限运行，系统拦截了点声的模拟点
 NOTICE_NO_ADMIN = '该窗口以管理员权限运行，系统拦截了点声的模拟点击/输入；当前 Windows 账户不是管理员，无法兼容'
 
 
-def kept_message(copied, can_elevate=True):
-    """The text an administrator window refused is kept: what the user is told."""
+def kept_message(copied, can_elevate=True, reason='elevated'):
+    """Text that did not reach the window is kept: what the user is told. reason is the
+    result's not_typed: 'elevated' (an administrator window), 'partial' or 'refused'
+    (Windows refused some or all keystrokes: lock screen, UAC prompt)."""
+    if reason == 'partial':   # the clipboard holds the full text: pasting it as is would repeat the start
+        where = ('全文已复制到剪贴板：请先删掉已输入的部分，再按 Ctrl+V 粘贴' if copied
+                 else '剪贴板被占用，全文保留在点声主窗口的本次结果里')
+        return f'部分文字没能输入：系统中途拒绝了点声的模拟输入（可能是锁屏或 UAC 提示）。{where}。'
     where = ('文字已复制到剪贴板，按 Ctrl+V 粘贴' if copied
              else '剪贴板被占用，文字保留在点声主窗口的本次结果里')
+    if reason != 'elevated':
+        return f'文字没能输入：系统拒绝了点声的模拟输入（可能是锁屏或 UAC 提示）。{where}。'
     fix = f'在 {SETTING} 开启后可直接输入' if can_elevate else '当前 Windows 账户不是管理员，无法兼容'
     return f'文字没能输入：该窗口以管理员权限运行，系统拦截了点声的模拟输入。{where}；{fix}。'
 

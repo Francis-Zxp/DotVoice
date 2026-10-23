@@ -296,7 +296,9 @@ function onCursor(p: Point) {
   cursor = p;
   if (laserOn()) trail.push({ ...p, t: performance.now() });
   if (drawing) addInk(p);
-  schedule();
+  // Only what follows the pointer needs a frame; an idle stage must reach stage_idle
+  // (each idle frame restarts that timer, and the shell streams samples while it shows).
+  if (laserOn() || spotOn() || drawing || laserA > 0 || spotA > 0) schedule();
 }
 
 if (inTauri) {
@@ -357,6 +359,13 @@ onCore((event, data) => {
         repaintInk();
       }
     }
+  } else if (event === 'core_exit') {
+    // The shell hid the stage and forgot the pointer; the restarted core starts unlatched.
+    pointer = latched = drawing = false;
+    live = null;
+    trail.length = 0;
+    strokes.length = 0;
+    repaintInk();
   } else if (event === 'mode' && data.value !== 'present') {
     pointer = latched = drawing = false;
     live = null;

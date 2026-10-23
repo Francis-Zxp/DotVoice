@@ -19,16 +19,17 @@ function greeting() {
   return h < 5 ? '夜深了' : h < 11 ? '早上好' : h < 13 ? '中午好' : h < 18 ? '下午好' : '晚上好';
 }
 
+/* Time in the current phase. The start comes from the store, so leaving the page and coming
+   back keeps counting (and the first frame never uses an old start). */
 function useElapsed(running: boolean) {
-  const [start, setStart] = useState(0);
+  const since = useStore((s) => s.phaseAt);
   const [, tick] = useState(0);
   useEffect(() => {
     if (!running) return;
-    setStart(Date.now());
     const t = window.setInterval(() => tick((n) => n + 1), 250);
     return () => clearInterval(t);
   }, [running]);
-  return running ? Date.now() - start : 0;
+  return running ? Math.max(0, Date.now() - since) : 0;
 }
 
 export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevices?: () => void }) {
@@ -54,7 +55,12 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
   const waveOnly = (listening || thinking) && !live;
 
   let stage: ScoreStage = 'idle';
-  let text = `${greeting()}。\n${toggleKey ?? '长按 ⑦'} 切换模式，${narrow ? '\n' : ''}按 ⑥ 开始说话。`;
+  // The Hanvon PV60 has a voice key and no ⑦ (a switch key shows only once one is bound).
+  const pv60 = selected === 'pv60';
+  const recordKey = pv60 ? '语音键' : '⑥';
+  // Bindings loaded: only a bound switch key is named (a cleared ⑦ says nothing).
+  const switchKey = bindings ? (toggleKey ?? '') : (pv60 ? '' : '长按 ⑦');
+  let text = `${greeting()}。\n${switchKey ? `${switchKey} 切换模式，${narrow ? '\n' : ''}` : ''}按 ${recordKey} 开始说话。`;
   if (listening) { stage = 'listening'; text = live; }
   else if (thinking) { stage = live ? 'thinking' : 'idle'; text = live || '声音已收到，正在识别…'; }
   else if (result && phase === 'idle') {
@@ -62,7 +68,7 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
     text = result.external ? `${handedTo(result.app)}。\n文字由它直接输入到光标处。`
       : result.text?.trim() ? result.text.trim() : '本次没有识别到文字。';
   }
-  else if (phase === 'disconnected') text = `${greeting()}。\n启用语音后，${narrow ? '\n' : ''}按笔上的 ⑥ 开始说话。`;
+  else if (phase === 'disconnected') text = `${greeting()}。\n启用语音后，${narrow ? '\n' : ''}按笔上的 ${recordKey} 开始说话。`;
   else if (phase === 'error') text = '连接断开了。\n重新连接后再说一次。';
 
   const transcript = useRef<HTMLDivElement>(null);
@@ -139,7 +145,7 @@ export function VoicePage({ onNotes, onDevices }: { onNotes?: () => void; onDevi
         <AnimatePresence>
           {stage === 'answer' && result && <ResultCard key="result" result={result} />}
         </AnimatePresence>
-        <Controls listening={listening} narrow={narrow} />
+        <Controls listening={listening} narrow={narrow} reduced={reduced} recordKey={recordKey} />
       </section>
       <aside className="flex min-h-0 flex-col gap-4">
         <ModeList compact={short} />
@@ -154,7 +160,8 @@ function StatusLine({ result }: { result: Result | null }) {
   const phase = useStore((s) => s.state.phase);
   const whisper = useStore((s) => !!s.state.whisper);
   const engine = useStore((s) => s.engine);
-  const handed = result?.external ? handedTo(result.app) : result?.not_typed ? '没能输入到管理员窗口'
+  const handed = result?.external ? handedTo(result.app)
+    : result?.not_typed ? (result.not_typed === 'elevated' ? '没能输入到管理员窗口' : '文字没能输入')
     : engine.kind === 'openless' ? '已交给 OpenLess 输入' : `已输入 · ${engine.label}`;
   // Same words as the result card: no check mark for a result that saved or typed nothing.
   const outcome = result?.destination === 'notes'
@@ -220,7 +227,7 @@ function ModePill({ mode, onColor }: { mode: Mode; onColor: boolean }) {
   );
 }
 
-function Controls({ listening, narrow }: { listening: boolean; narrow: boolean }) {
+function Controls({ listening, narrow, reduced, recordKey }: { listening: boolean; narrow: boolean; reduced: boolean; recordKey: string }) {
   const phase = useStore((s) => s.state.phase);
   const busy = ['starting', 'recording', 'processing'].includes(phase);
   const ring = useRef<HTMLSpanElement>(null);
@@ -233,13 +240,14 @@ function Controls({ listening, narrow }: { listening: boolean; narrow: boolean }
     error: { icon: RotateCcw, label: '重新连接', action: 'arm', tone: 'brand' },
   }[phase];
   const Icon = config.icon;
-  // The ring breathes with the measured volume while listening (no React renders).
+  // The ring breathes with the measured volume while listening (no React renders); still
+  // under reduced motion.
   useEffect(() => {
-    if (!listening) { if (ring.current) ring.current.style.transform = ''; return; }
+    if (!listening || reduced) { if (ring.current) ring.current.style.transform = ''; return; }
     return levels.subscribe((level) => {
       if (ring.current) ring.current.style.transform = `scale(${1 + Math.min(.32, Math.sqrt(Math.max(0, level)) * .9)})`;
     });
-  }, [listening]);
+  }, [listening, reduced]);
   return (
     <footer className={`grid items-end pb-6 pt-2 ${narrow ? 'px-6' : 'px-8'}`} style={{ gridTemplateColumns: '1fr auto 1fr' }}>
       <div>
@@ -267,7 +275,7 @@ function Controls({ listening, narrow }: { listening: boolean; narrow: boolean }
         <span className="text-[12px] font-semibold" style={{ opacity: listening ? .88 : .62 }}>{config.label}</span>
       </div>
       <div className="text-right text-[12px]" style={{ opacity: listening ? .82 : .55 }}>
-        {listening ? '停顿也没关系，按 ⑥ 结束' : phase === 'idle' ? <>按笔上的 <b className="font-semibold">⑥</b> 说话</> : ''}
+        {listening ? `停顿也没关系，按 ${recordKey} 结束` : phase === 'idle' ? <>按笔上的 <b className="font-semibold">{recordKey}</b> 说话</> : ''}
       </div>
     </footer>
   );
@@ -282,12 +290,13 @@ function ResultCard({ result }: { result: Result }) {
   }
   const notes = result.destination === 'notes';
   const external = !!result.external;
-  const refused = !notes && !!result.not_typed;  // an administrator window dropped the keystrokes
+  const refused = !notes && !!result.not_typed;  // the keystrokes did not arrive (administrator window, lock screen, UAC)
+  const elevated = refused && result.not_typed === 'elevated';
   const empty = !notes && !external && !!result.empty_text;  // nothing recognised, nothing typed
   const unsaved = notes && (!!result.note_skipped || !!result.note_error);
   const timing = result.seconds != null && !external && !refused && !empty && !unsaved ? `结束后 ${result.seconds.toFixed(2)} 秒完成` : '';
   const detail = notes ? (unsaved ? '' : '可在笔记页编辑、打标签') : external ? '它会把文字直接输入到光标处；点声看不到文字'
-    : refused ? (result.copied ? '已复制到剪贴板，按 Ctrl+V 粘贴' : '请复制后粘贴') + ' · 设置 → 通用 → 兼容管理员权限窗口'
+    : refused ? (result.copied ? '已复制到剪贴板，按 Ctrl+V 粘贴' : '请复制后粘贴') + (elevated ? ' · 设置 → 通用 → 兼容管理员权限窗口' : '')
     : empty ? '没有输入任何内容' : '点声不会自动发送或回车';
   return (
     <motion.div initial={{ opacity: 0, y: 18, scale: .97 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 10, scale: .98 }} transition={spring.soft}
@@ -296,7 +305,7 @@ function ResultCard({ result }: { result: Result }) {
         {notes ? <NotebookPen size={16} /> : refused ? <ShieldAlert size={16} /> : empty ? <MicOff size={16} /> : <Check size={17} />}
       </span>
       <div className="min-w-0 flex-1">
-        <div className="text-[13.5px] font-semibold">{notes ? (result.note_skipped ? '没有识别到内容，未保存' : result.note_error || '已保存到笔记') : external ? handedTo(result.app) : refused ? '没能输入到管理员窗口' : empty ? '没有识别出文字' : '已输入到光标处'}</div>
+        <div className="text-[13.5px] font-semibold">{notes ? (result.note_skipped ? '没有识别到内容，未保存' : result.note_error || '已保存到笔记') : external ? handedTo(result.app) : refused ? (elevated ? '没能输入到管理员窗口' : '文字没能输入') : empty ? '没有识别出文字' : '已输入到光标处'}</div>
         <div className="faint truncate text-[12px]">{[timing, detail].filter(Boolean).join(' · ')}</div>
       </div>
       {/* Nothing to copy from an empty result (copying '' would clear the clipboard). */}
@@ -312,14 +321,19 @@ function ModeList({ compact }: { compact: boolean }) {
   const tool = useStore((s) => s.tool);
   const bindings = useStore((s) => s.bindings);
   const selected = useStore((s) => s.selected);
-  const toggleKey = bindings?.devices?.[selected]?.toggle_mode?.label ?? '长按 ⑦';
+  // The keys actually bound on this model (PV60 has no ⑦; a cleared key is not offered).
+  const keys = bindings?.devices?.[selected];
+  const hint = bindings
+    ? [keys?.toggle_mode?.label && `${keys.toggle_mode.label} 循环切换`, keys?.quick_note?.label && `${keys.quick_note.label} 闪念笔记`].filter(Boolean).join(' · ')
+    : selected === 'pv60' ? '' : '长按 ⑦ 循环切换 · 短按 ⑦ 闪念笔记';
   return (
     <Glass className="shrink-0 p-2">
       {(['input', 'notes', 'present'] as Mode[]).map((value) => {
         const Icon = MODE_ICON[value];
         const active = mode === value;
         return (
-          <button key={value} aria-pressed={active} onClick={() => !active && act('set_mode', { value, source: 'ui' })}
+          /* With a switch deferred to the end of the recording, the current mode cancels it (core set_mode). */
+          <button key={value} aria-pressed={active} onClick={() => (!active || pending) && act('set_mode', { value, source: 'ui' })}
             className={`mode-${value} tile flex w-full items-center gap-3 ${compact ? 'px-2.5 py-2' : 'p-2.5'}`}>
             {active && <motion.span layoutId="mode-tile" className="absolute inset-0 rounded-[14px]"
               style={{ background: 'linear-gradient(135deg, color-mix(in srgb, var(--mode) 13%, var(--panel-solid)), color-mix(in srgb, var(--mode) 6%, var(--panel-solid)))', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--mode) 26%, transparent), 0 6px 18px -12px var(--mode)' }}
@@ -334,7 +348,7 @@ function ModeList({ compact }: { compact: boolean }) {
           </button>
         );
       })}
-      {!compact && <div className="faint flex items-center gap-1.5 px-3 pb-1 pt-1.5 text-[11.5px]" title={`${toggleKey} 在三种模式间循环 · 短按 ⑦ 记闪念笔记`}><MousePointer2 size={12} className="shrink-0" /><span className="truncate">{toggleKey} 循环切换 · 短按 ⑦ 闪念笔记</span></div>}
+      {!compact && hint && <div className="faint flex items-center gap-1.5 px-3 pb-1 pt-1.5 text-[11.5px]" title={hint}><MousePointer2 size={12} className="shrink-0" /><span className="truncate">{hint}</span></div>}
     </Glass>
   );
 }
@@ -380,7 +394,8 @@ function DeviceList({ compact, onOpen }: { compact: boolean; onOpen?: () => void
       </div>
       {t && !compact && (
         <div className="faint mx-2.5 mt-1 border-t pt-2 text-[11.5px]" style={{ borderColor: 'var(--hair)' }}>
-          本轮 <span className="num">{t.sessions ?? 0}</span> 段 · 说话约 {duration(t.speech_seconds ?? 0)}
+          {/* No cycle running (no full-charge report yet, or it ended at 10%): these are the totals. */}
+          {usage?.active ? '本轮' : '累计'} <span className="num">{t.sessions ?? 0}</span> 段 · 说话约 {duration(t.speech_seconds ?? 0)}
         </div>
       )}
     </Glass>

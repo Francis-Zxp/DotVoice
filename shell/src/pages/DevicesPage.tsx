@@ -74,6 +74,7 @@ function PenCard({ pen, item, index }: { pen: PenInstance; item?: RosterItem; in
   const notify = useStore((s) => s.notify);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(pen.label);
+  const saving = useRef(false);
   const input = useRef<HTMLInputElement>(null);
   const Pen = ART[pen.model] ?? BaseusArt;
   const battery = pen.battery?.percent ?? null;
@@ -81,10 +82,17 @@ function PenCard({ pen, item, index }: { pen: PenInstance; item?: RosterItem; in
   useEffect(() => { if (editing) input.current?.select(); }, [editing]);
 
   async function save() {
+    if (saving.current) return;
     const label = cleanLabel(draft);
-    setEditing(false);
-    if (!label || label === pen.label) { setDraft(pen.label); return; }
-    if (await rename(pen.id, label)) notify(`已改名为“${label}”`, 'success');
+    if (label === pen.label) { setEditing(false); return; }
+    // Empty restores the default name (core: rename '' → 倍思 #n); a failure keeps the input.
+    saving.current = true;
+    const ok = await rename(pen.id, label);
+    saving.current = false;
+    if (ok) {
+      setEditing(false);
+      notify(label ? `已改名为“${label}”` : '已恢复默认名称', 'success');
+    }
   }
 
   return (
@@ -98,7 +106,7 @@ function PenCard({ pen, item, index }: { pen: PenInstance; item?: RosterItem; in
       <div className="relative z-[1] min-h-[34px]">
         {editing ? (
           <form className="flex items-center gap-1.5" onSubmit={(e) => { e.preventDefault(); save(); }}>
-            <input ref={input} className="field h-8 flex-1 text-[15px] font-semibold" value={draft} maxLength={24} aria-label="笔的名称"
+            <input ref={input} className="field h-8 flex-1 text-[15px] font-semibold" value={draft} maxLength={16} aria-label="笔的名称" placeholder="留空恢复默认名称"
               onChange={(e) => setDraft(e.target.value)} onBlur={save}
               onKeyDown={(e) => { if (e.key === 'Escape') { setDraft(pen.label); setEditing(false); } }} />
             <button type="submit" className="btn btn-sm btn-icon btn-primary" aria-label="保存名称" onMouseDown={(e) => e.preventDefault()}><Check size={14} /></button>
@@ -143,7 +151,8 @@ function ModelCards() {
     const snapshot = await act<Snapshot>('select_device', { device, mode: nextMode });
     if (snapshot) {
       useStore.getState().apply(snapshot);
-      notify('已切换设备。回到语音页手动启用。', 'success');
+      // The PV60's 按住说话 / 单击切换 switch keeps the device: say what changed.
+      notify(device === selected ? `已改为${nextMode === 'hold' ? '按住说话' : '单击切换'}。` : '已切换设备。回到语音页手动启用。', 'success');
     }
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { closeStep, hotkeyChoice, renewWhileActive, trapTab, type Timers, type WindowPresence } from './wizard';
+import { closeStep, hotkeyChoice, renewWhileActive, trapTab, typedThisRound, type Timers, type WindowPresence } from './wizard';
 
 /* A window that can be shown / hidden / focused by the test, and timers it can advance. */
 function fakeWindow(active = true) {
@@ -116,5 +116,16 @@ describe('wizard engine choice', () => {
     expect(hotkeyChoice(current, 'shandianshuo')).toEqual({ profile: 'shandianshuo' });
     // Another app: its own default shortcut, never the previous app's combo.
     expect(hotkeyChoice(current, 'typeless')).toEqual({ profile: 'typeless', keys: '' });
+  });
+});
+
+describe('wizard 试一句 with another dictation app', () => {
+  it('counts only text that appeared during this round as typed by the app', () => {
+    expect(typedThisRound('', '')).toBe(false);
+    expect(typedThisRound('今天下午开会', '')).toBe(true);
+    // The first round's text left in the box, or words typed by hand before speaking: no proof.
+    expect(typedThisRound('今天下午开会', '今天下午开会')).toBe(false);
+    expect(typedThisRound('今天下午开会。明天见', '今天下午开会')).toBe(true);
+    expect(typedThisRound('   ', '')).toBe(false);
   });
 });

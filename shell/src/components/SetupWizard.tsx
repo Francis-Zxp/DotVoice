@@ -11,7 +11,7 @@ import { call } from '../lib/bridge';
 import { ENGINE_TITLE, engineToneVars, handedTo, HELP, hotkeyWarnings, missing, SECRET, STYLE_TEXT, switchText, VOLC_RESOURCES } from '../lib/engine';
 import { act, levels, useStore } from '../lib/store';
 import type { EngineKind, EnginePrefs, HotkeyApp, Prefs } from '../lib/types';
-import { closeStep, hasUnsavedSecret, hotkeyChoice, renewWhileActive, trapTab, windowPresence } from '../lib/wizard';
+import { closeStep, hasUnsavedSecret, hotkeyChoice, renewWhileActive, trapTab, typedThisRound, windowPresence } from '../lib/wizard';
 import { LiveWave } from '../overlay/LiveWave';
 import { DEFAULT_ENGINE, ENGINE_ICON } from '../pages/EngineSection';
 import { BaseusArt, Pv60Art } from './DeviceArt';
@@ -40,6 +40,8 @@ function Wizard() {
   const close = useStore((s) => s.closeWizard);
   const prefs = useStore((s) => s.prefs);
   const engine = prefs?.engine ?? DEFAULT_ENGINE;
+  // Run again from settings: closing it never brings it back at the next launch.
+  const setupDone = prefs?.setup?.done !== false;
   const secrets = useStore((s) => s.secrets);
   const [step, setStep] = useState(0);
   const [dir, setDir] = useState(1);
@@ -49,10 +51,16 @@ function Wizard() {
       ? { key: 'hotkey:' + engine.hotkey.profile, kind: 'hotkey', title: info.app ?? info.label, profile: engine.hotkey.profile }
       : { key: engine.kind, kind: engine.kind, title: ENGINE_TITLE[engine.kind] }));
   const [applying, setApplying] = useState(false);
-  // An API key typed or pasted but not saved: closing would throw it away, so ask first.
-  const [confirming, setConfirming] = useState(false);
+  // An API key typed or pasted but not saved: closing, another step or another engine card
+  // would throw it away, so ask first ('close' / 'leave'; `pending` runs on 丢弃).
+  const [confirming, setConfirming] = useState<'close' | 'leave' | null>(null);
+  const pending = useRef<() => void>(close);
   const dialog = useRef<HTMLDivElement>(null);
-  const go = (next: number) => { setDir(next > step ? 1 : -1); setStep(next); setConfirming(false); };
+  function guard(action: () => void) {
+    if (hasUnsavedSecret(dialog.current)) { pending.current = action; setConfirming('leave'); return; }
+    action();
+  }
+  const go = (next: number) => guard(() => { setDir(next > step ? 1 : -1); setStep(next); setConfirming(null); });
 
   // While the wizard is in front a press of ⑥ is a test: nothing is typed or saved. Hidden to
   // the tray or behind another app, dictation works as usual at once.
@@ -60,8 +68,8 @@ function Wizard() {
     () => { call('wizard_test', { enabled: true }).catch(() => {}); },
     () => { call('wizard_test', { enabled: false }).catch(() => {}); }, 30000), []);
   function requestClose(typing = false) {
-    const next = closeStep({ typing, unsaved: hasUnsavedSecret(dialog.current), confirming });
-    if (next === 'confirm') setConfirming(true);
+    const next = closeStep({ typing, unsaved: hasUnsavedSecret(dialog.current), confirming: confirming === 'close' });
+    if (next === 'confirm') { pending.current = close; setConfirming('close'); }
     else if (next === 'close') close();
   }
   const latestClose = useRef(requestClose);
@@ -121,13 +129,13 @@ function Wizard() {
             </AnimatePresence>
           </div>
           <StepDots step={step} onGo={(i) => go(i)} />
-          <button className="btn btn-ghost btn-sm" onClick={() => requestClose()} title="关闭向导；下次启动点声时还会出现">稍后再说</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => requestClose()} title={setupDone ? '关闭向导' : '关闭向导；下次启动点声时还会出现'}>稍后再说</button>
         </header>
         <div className="wizard-body scroll">
           <AnimatePresence mode="wait" initial={false} custom={dir}>
             <motion.div key={step} className={step === 1 ? undefined : 'wizard-step'} custom={dir} variants={slide} initial="enter" animate="center" exit="exit" transition={spring.soft}>
               {step === 0 && <DeviceStep />}
-              {step === 1 && <EngineStep choice={choice} onChoose={setChoice} engine={engine} />}
+              {step === 1 && <EngineStep choice={choice} onChoose={(c) => { if (c.key !== choice.key) guard(() => setChoice(c)); }} engine={engine} />}
               {step === 2 && <TryStep onBack={() => go(1)} />}
               {step === 3 && <DoneStep />}
             </motion.div>
@@ -137,9 +145,9 @@ function Wizard() {
           {confirming && (
             <motion.div key="unsaved" className="wizard-confirm" role="alert" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 6, transition: { duration: .12 } }} transition={spring.snappy}>
-              <span className="flex-1">粘贴的 API Key 还没有保存，关闭向导会丢弃它。</span>
-              <button className="btn btn-sm" onClick={() => setConfirming(false)}>继续填写</button>
-              <button className="btn btn-ghost btn-sm" onClick={close}>丢弃并关闭</button>
+              <span className="flex-1">{confirming === 'close' ? '粘贴的 API Key 还没有保存，关闭向导会丢弃它。' : '粘贴的 API Key 还没有保存，继续会丢弃它。'}</span>
+              <button className="btn btn-sm" onClick={() => setConfirming(null)}>继续填写</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => { setConfirming(null); pending.current(); }}>{confirming === 'close' ? '丢弃并关闭' : '丢弃并继续'}</button>
             </motion.div>
           )}
         </AnimatePresence>
@@ -270,7 +278,7 @@ function EngineStep({ choice, onChoose, engine }: { choice: Choice; onChoose: (c
     { key: 'volc', kind: 'volc', title: '豆包语音', badge: '推荐', desc: '在线流式，最快最准；需要火山引擎的 API Key' },
     { key: 'dashscope', kind: 'dashscope', title: '阿里云百炼', desc: 'Fun-ASR 实时识别；需要百炼的 API Key' },
     ...(showOpenLess ? [{ key: 'openless', kind: 'openless' as const, title: 'OpenLess',
-      desc: !openless ? '正在检查…' : openless.running ? (openless.remote_input && openless.paired ? '已安装 · 运行中 · 远程输入已开' : '已安装 · 运行中 · 需开启远程输入') : '已安装 · 未运行' }] : []),
+      desc: !openless ? (data.loading ? '正在检查…' : '暂时无法检查，可在设置里刷新') : openless.running ? (openless.remote_input && openless.paired ? '已安装 · 运行中 · 远程输入已开' : '已安装 · 运行中 · 需开启远程输入') : '已安装 · 未运行' }] : []),
     ...apps.map((app) => ({ key: 'hotkey:' + app.profile, kind: 'hotkey' as const, profile: app.profile, title: app.name, badge: '实验',
       desc: `检测到 · 热键桥接，${app.running ? '正在运行' : '已安装'}` })),
   ];
@@ -371,12 +379,18 @@ function TryStep({ onBack }: { onBack: () => void }) {
   const engine = useStore((s) => s.engine);
   const result = useStore((s) => s.wizardResult);
   const reduced = useStore((s) => !!s.prefs?.appearance.reduced_motion);
+  // The Hanvon PV60 records with its voice key, not ⑥ (as in step 1).
+  const pv60 = useStore((s) => s.selected) === 'pv60';
+  const keyName = pv60 ? '语音键' : '⑥';
   const [since] = useState(() => Date.now());
   const [arming, setArming] = useState(false);
   const [typed, setTyped] = useState('');
+  const baseline = useRef('');
   const box = useRef<HTMLTextAreaElement>(null);
   const fresh = result && result.at >= since ? result : null;
   const phase = state.phase;
+  // The text box as this round began: only new text counts as the other app typing.
+  useEffect(() => { if (phase === 'starting' || phase === 'recording') baseline.current = typed; }, [phase]);  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     useStore.setState({ wizardResult: null });
     if (engine.external) box.current?.focus();
@@ -387,11 +401,11 @@ function TryStep({ onBack }: { onBack: () => void }) {
     setArming(false);
   }
   const external = engine.external;
-  const typedOk = external && typed.trim().length > 0;
+  const typedOk = external && typedThisRound(typed, baseline.current);
   let body: ReactNode;
   if (phase === 'disconnected') {
     body = (
-      <Stage tone="calm" title="语音输入已暂停" text="启用后按住 ⑥ 说一句话。">
+      <Stage tone="calm" title="语音输入已暂停" text={`启用后按住 ${keyName} 说一句话。`}>
         <button className="btn btn-primary" disabled={arming} onClick={arm}>{arming ? <Loader2 size={14} className="animate-spin" /> : <Mic size={15} />}启用语音</button>
       </Stage>
     );
@@ -404,7 +418,7 @@ function TryStep({ onBack }: { onBack: () => void }) {
     );
   } else if (phase === 'recording') {
     body = (
-      <Stage tone="live" title="正在听…" text="说完松开 ⑥（短按开始的话，再按一下）。">
+      <Stage tone="live" title="正在听…" text={`说完松开 ${keyName}（短按开始的话，再按一下）。`}>
         <span className="mode-input block"><LiveWave width={360} height={60} state="listening" tone="input-wizard" reduced={reduced} /></span>
       </Stage>
     );
@@ -428,15 +442,16 @@ function TryStep({ onBack }: { onBack: () => void }) {
         <VoiceScore text={fresh.text.trim() || '没有识别到文字'} stage="answer" envelope={fresh.envelope ?? null} size={24} reduced={reduced} />
         <p className="try-ok"><Check size={14} strokeWidth={2.8} />{fresh.text.trim() ? `${engine.label}识别成功` : '没有识别到文字'}
           {fresh.seconds != null && <span className="faint num"> · 松开后 {fresh.seconds.toFixed(1)} 秒</span>}</p>
-        <p className="faint text-[12px]">文字只显示在这里，没有输入到别处。想再试，就再按一次 ⑥。</p>
+        <p className="faint text-[12px]">文字只显示在这里，没有输入到别处。想再试，就再按一次 {keyName}。</p>
       </div>
     );
   } else {
-    body = <Stage tone="calm" title="按住 ⑥ 说一句话" text={external ? `松开后，${engine.label} 会把文字输入到下面的框里。` : '松开后结果显示在这里，不会输入到别的窗口。'} />;
+    body = <Stage tone="calm" title={`按住 ${keyName} 说一句话`} text={external ? `松开后，${engine.label} 会把文字输入到下面的框里。` : '松开后结果显示在这里，不会输入到别的窗口。'} />;
   }
+  const Art = pv60 ? Pv60Art : BaseusArt;
   return (
     <div className="wizard-split">
-      <div className="wizard-art"><BaseusArt className="h-full w-full" highlight="6" /></div>
+      <div className="wizard-art"><Art className="h-full w-full" highlight="6" /></div>
       <div className="grid content-start gap-3">
         <div className="try-stage glass-flat">
           <AnimatePresence mode="popLayout" initial={false}>
@@ -446,7 +461,7 @@ function TryStep({ onBack }: { onBack: () => void }) {
         </div>
         {external && (
           <label className="grid gap-1.5">
-            <span className="faint text-[12px]">点一下这个框，再按 ⑥ 说话：</span>
+            <span className="faint text-[12px]">点一下这个框，再按 {keyName} 说话：</span>
             <textarea ref={box} className="field min-h-[72px]" aria-label="试说输入框" value={typed} onChange={(e) => setTyped(e.target.value)}
               placeholder={`${engine.label} 输入的文字会出现在这里`} />
           </label>
@@ -477,8 +492,15 @@ const CHEATS: { key: string; title: string; text: string; icon?: typeof Mic }[] 
   { key: '演示', title: '演示模式', text: '按住 ⑤ 用激光 / 聚光灯 / 放大镜，双击 ⑤ 换工具；② 常亮激光，⑧ 按住画标注', icon: Presentation },
 ];
 
+/* The Hanvon PV60: its voice key records; its other keys work once bound in settings. */
+const PV60_CHEATS: typeof CHEATS = [
+  { key: '语音键', title: '说话', text: '按住说话、松开结束；选了“单击切换”时按一下开始、再按一下结束' },
+  { key: '其他键', title: '自定义', text: '其他按键在「设置 → 按键 → 汉王」绑定后生效（需先启用语音）' },
+];
+
 function DoneStep() {
   const engine = useStore((s) => s.engine);
+  const items = useStore((s) => s.selected) === 'pv60' ? PV60_CHEATS : CHEATS;
   return (
     <div className="grid gap-4">
       <div className="flex items-center gap-3">
@@ -486,12 +508,12 @@ function DoneStep() {
         <p className="muted text-[13px] leading-relaxed">语音引擎：<b>{engine.label}</b>{engine.external ? '（热键桥接）' : ''}。下面是笔上的按键速查；以后在「设置」里随时调整，也可以重新运行这个向导。</p>
       </div>
       <div className="cheat" data-cheat>
-        {CHEATS.map((item, i) => (
+        {items.map((item, i) => (
           <motion.div key={item.key} className="cheat-item" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ ...spring.soft, delay: .04 * i }}>
             <span className="key-badge">{item.key}</span>
             <span className="min-w-0">
               <span className="block text-[13.5px] font-semibold">{item.title}</span>
-              <span className="muted block text-[12.5px] leading-relaxed">{item.key === '⑥' && engine.external ? `${item.text}（交给 ${engine.label}）` : item.text}</span>
+              <span className="muted block text-[12.5px] leading-relaxed">{i === 0 && engine.external ? `${item.text}（交给 ${engine.label}）` : item.text}</span>
             </span>
           </motion.div>
         ))}

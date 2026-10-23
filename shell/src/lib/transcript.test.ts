@@ -100,6 +100,16 @@ describe('meeting notes', () => {
     expect(labelled('我还没决定')).toEqual(['待定:还没决定']);
     expect(labelled('经过讨论，最终确定采用方案B，原因是成本低、周期短。')).toContain('结论:最终确定采用方案B');
   });
+  it('keeps a negation a few characters back: not decided is open, not needed is no requirement', () => {
+    expect(labelOf('还没有决定采用新方案', '还没有决定采用新方案')).toBe('待定');
+    expect(labelled('还没有决定采用新方案').some((m) => m.startsWith('结论:'))).toBe(false);
+    for (const text of ['不需要确保每次都保存', '没有必要一定要今天完成']) {
+      expect(labelled(text).some((m) => m.startsWith('要求:')), text).toBe(false);
+    }
+    // The positive forms are unchanged.
+    expect(labelled('需要确保每次都保存')).toContain('要求:需要确保每次都保存');
+    expect(labelled('必须保留原始文字')).toContain('要求:必须保留原始文字');
+  });
 });
 
 describe('research notes', () => {

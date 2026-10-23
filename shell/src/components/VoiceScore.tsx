@@ -10,6 +10,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { levels } from '../lib/store';
 import { keywords, type Mark } from '../lib/transcript';
+import { useMedia } from './ui';
 
 export type ScoreStage = 'idle' | 'listening' | 'thinking' | 'answer';
 
@@ -85,6 +86,8 @@ export function VoiceScore({ text, stage, envelope, size = 30, onColor = false, 
   const history = useRef<number[]>([]);
   const lastLevel = useRef(0);
   const stageAt = useRef(performance.now());
+  // A resting score repaints when Windows switches light / dark (its colour is read per frame).
+  const dark = useMedia('(prefers-color-scheme: dark)');
   const [layout, setLayout] = useState(0);
   const [boxes, setBoxes] = useState<{ mark: Mark; x: number; y: number; w: number; label: boolean }[]>([]);
   const chars = useMemo(() => Array.from(text), [text]);
@@ -210,7 +213,7 @@ export function VoiceScore({ text, stage, envelope, size = 30, onColor = false, 
     draw(performance.now());
     if (animated()) loop();
     return () => { clearTimeout(timer); cancelAnimationFrame(raf); };
-  }, [stage, chars, envelope, size, onColor, reduced, dim, layout]);
+  }, [stage, chars, envelope, size, onColor, reduced, dim, layout, dark]);
 
   const marked = new Set<number>();
   marks.forEach((m) => { for (let i = m.start; i < m.end; i++) marked.add(i); });

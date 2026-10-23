@@ -108,8 +108,11 @@ def _clean(device, slot, binding):
                 not all(type(v) is int and 1 <= v <= 254 for v in vks)):
             raise ValueError('键盘按键无效')
         return {'source': source, 'vk': sorted(set(vks)), 'label': label}
-    fire = [_code(c) for c in binding.get('fire', [])]
-    ignore = [_code(c) for c in binding.get('ignore', [])]
+    fire, ignore = binding.get('fire', []), binding.get('ignore', [])
+    if not isinstance(fire, list) or not isinstance(ignore, list):
+        raise ValueError('按键码无效')  # e.g. "fire": null in a hand-edited bindings.json
+    fire = [_code(c) for c in fire]
+    ignore = [_code(c) for c in ignore]
     if not fire or not all(len(c) == 2 and all(ch in '0123456789abcdef' for ch in c)
                            for c in fire + ignore):
         raise ValueError('按键码无效')
@@ -167,22 +170,27 @@ def _read(path):
         return json.loads(path.read_text(encoding='utf-8-sig'))
 
 
+def _saved_at(path, form='%Y-%m-%d %H:%M'):
+    return time.strftime(form, time.localtime(path.stat().st_mtime))
+
+
 def _load(saved):
     """A bindings file's contents -> (user bindings, labels of hold keys reset once).
     Raises AttributeError for a file of the wrong shape."""
     user, reset = {device: {} for device in DEVICES}, []
     version = saved.get('version', 1)
-    old = not isinstance(version, int) or version < VERSION
+    version = version if isinstance(version, int) else 1
     for device, slots in saved.get('devices', {}).items():
         for slot, binding in slots.items():
             if device in DEVICES and slot in SLOTS:
-                if old and _retired(slot, binding):
+                # Version 2 already had the vendor wheel defaults: its cleared wheel slot is the user's.
+                if version < 2 and _retired(slot, binding):
                     continue
                 try:
                     cleaned = _clean(device, slot, binding)
                 except ValueError:
                     continue
-                if old and _mislearned_hold(device, slot, cleaned):
+                if version < 3 and _mislearned_hold(device, slot, cleaned):
                     reset.append(DEFAULTS.get(device, {}).get(slot, {}).get('label') or slot)
                     continue  # once, when the file is upgraded: back to the default
                 user[device][slot] = cleaned
@@ -201,6 +209,7 @@ class Keymap:
         self.last_fire = {}
         if self.path.exists():
             reset, problem = [], None
+            recovered = self.path.with_name(RECOVERED)
             try:
                 self.user, reset = _load(_read(self.path))
             except OSError:
@@ -210,24 +219,61 @@ class Keymap:
             if problem:
                 # bindings.json is kept as it is. Changes go to bindings-recovered.json, which is
                 # read back while bindings.json stays unreadable - and the user is told every time.
-                recovered = self.path.with_name(RECOVERED)
-                kept = False
+                saved = None
                 if recovered.exists():
                     try:
+                        saved = _saved_at(recovered)
                         self.user = _load(_read(recovered))[0]
-                        kept = True
                     except (OSError, ValueError, AttributeError):
-                        pass
+                        saved = None
                 self.path = recovered
-                using = '正在使用之前另存的绑定（bindings-recovered.json）' if kept else '本次使用默认值'
+                using = (f'正在使用之前另存的绑定（bindings-recovered.json，{saved} 保存）' if saved
+                         else '本次使用默认值')
                 self.warning = (f'按键绑定文件 bindings.json {problem}：{using}；原文件保留，'
                                 f'修改会保存到 bindings-recovered.json。')
-            elif reset:
-                self.warning = HOLD_RESET_NOTICE.format(labels='、'.join(reset))
+            else:
+                notices = []
+                if recovered.exists():
+                    self._take_recovered(recovered, notices)  # before the save below changes the file time
+                if reset:
+                    notices.append(HOLD_RESET_NOTICE.format(labels='、'.join(reset)))
+                    try:
+                        self._save(self.user)  # every other binding exactly as it was
+                    except OSError:
+                        pass
+                self.warning = ' '.join(notices)
+
+    def _take_recovered(self, recovered, notices):
+        """bindings.json reads again, but an earlier session saved its changes to
+        bindings-recovered.json (bindings.json was unreadable then: that session started from the
+        defaults, so the copy holds just the slots changed then). Newer than bindings.json, those
+        slots go on top of it, one key still one action; older, bindings.json was edited since and
+        stays. The copy is then renamed, never deleted: it cannot come back later as "the saved
+        bindings"."""
+        reason = '早于 bindings.json 的修改'
+        try:
+            mtime = recovered.stat().st_mtime
+            changes = None
+            if mtime > self.path.stat().st_mtime:
                 try:
-                    self._save(self.user)  # every other binding exactly as it was
-                except OSError:
-                    pass
+                    changes = _load(_read(recovered))[0]
+                except (ValueError, AttributeError):
+                    reason = '无法读取'
+            if changes is not None:
+                self.user = user = copy.deepcopy(self.user)  # bindings() reads the merge so far
+                for device, slots in changes.items():
+                    for slot, binding in slots.items():
+                        self._release_others(user, device, slot, binding)
+                        user[device][slot] = binding
+                self._save(user)  # idempotent: if the rename below fails, the next start merges again
+            kept = recovered.with_name(f'{recovered.stem}-{time.strftime("%Y%m%d-%H%M%S", time.localtime(mtime))}.json')
+            recovered.rename(kept)  # Windows: never over another kept copy
+        except OSError:
+            return  # still there: looked at again at the next start
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))
+        notices.append((f'已并入 {when} 另存的按键修改（当时 bindings.json 无法读取）' if changes is not None else
+                        f'{when} 另存的按键绑定 bindings-recovered.json {reason}，未采用')
+                       + f'；该副本已改名为 {kept.name} 保留。')
 
     def bindings(self, device):
         with self.lock:
@@ -247,6 +293,8 @@ class Keymap:
             if self.learning:
                 learning = {k: self.learning[k] for k in ('device', 'slot', 'step', 'captured')}
             return {'devices': {device: self.bindings(device) for device in DEVICES},
+                    # Slots with a built-in binding: an unbound one can still be restored.
+                    'defaults': {device: sorted(DEFAULTS.get(device, {})) for device in DEVICES},
                     'learning': learning, 'warning': self.warning}
 
     def _save(self, user):
@@ -262,25 +310,31 @@ class Keymap:
         cleaned = _clean(device, slot, binding)
         with self.lock:
             user = copy.deepcopy(self.user)
-            moved = []
-            if cleaned and cleaned['source'] != 'keyboard':
-                # One physical key performs one action: release it from other slots.
-                codes = set(cleaned['fire'])
-                for other, existing in self.bindings(device).items():
-                    if other == slot or existing.get('source') != cleaned['source']:
-                        continue
-                    if codes & set(existing.get('fire', [])):
-                        user[device][other] = None
-                        moved.append(other)
-                    elif codes & set(existing.get('ignore', [])):
-                        # Its "release" is this key's press now: it must never swallow it.
-                        kept = {k: v for k, v in existing.items() if k != 'default'}
-                        kept['ignore'] = sorted(set(existing['ignore']) - codes)
-                        user[device][other] = kept
+            moved = self._release_others(user, device, slot, cleaned)
             user[device][slot] = cleaned
             self._save(user)
             self.user = user
             return {'binding': cleaned, 'released': moved}
+
+    def _release_others(self, user, device, slot, binding):
+        """One physical key performs one action: release `binding`'s codes from the other
+        slots (in `user`). Returns the slots it was taken from."""
+        moved = []
+        if not binding or binding['source'] == 'keyboard':
+            return moved
+        codes = set(binding['fire'])
+        for other, existing in self.bindings(device).items():
+            if other == slot or existing.get('source') != binding['source']:
+                continue
+            if codes & set(existing.get('fire', [])):
+                user[device][other] = None
+                moved.append(other)
+            elif codes & set(existing.get('ignore', [])):
+                # Its "release" is this key's press now: it must never swallow it.
+                kept = {k: v for k, v in existing.items() if k != 'default'}
+                kept['ignore'] = sorted(set(existing['ignore']) - codes)
+                user[device][other] = kept
+        return moved
 
     def reset(self, device, slot=None):
         with self.lock:
@@ -289,6 +343,8 @@ class Keymap:
                 user[device] = {}
             else:
                 user[device].pop(slot, None)
+                # The restored default's key may have moved to another slot meanwhile.
+                self._release_others(user, device, slot, DEFAULTS.get(device, {}).get(slot))
             self._save(user)
             self.user = user
 
@@ -526,8 +582,9 @@ class Keymap:
                 fire.add(learning['hold'][0][0])
                 if len(learning['hold']) > 1:
                     ignore.add(learning['hold'][1][0])
+            fire -= ignore  # the hold step proved it a release, even if a tap sent it too (⑧: 68 -> 69)
             binding = {'source': learning['source'], 'fire': sorted(fire),
-                       'ignore': sorted(ignore - fire), 'gesture': 'single',
+                       'ignore': sorted(ignore), 'gesture': 'single',
                        'label': '自定义 ' + '/'.join(sorted(c.upper() for c in fire))}
         if not learning['taps'] and not learning['hold']:
             self._progress('error', '没有收到按键，未保存修改')
